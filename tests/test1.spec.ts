@@ -24,6 +24,29 @@ function formatMoveInDate(date: Date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+async function selectRandomFromCombobox(
+  page: import('@playwright/test').Page,
+  name: string,
+) {
+  await page.getByRole('combobox', { name }).click();
+
+  let options = page.getByRole('option');
+  if ((await options.count()) === 0) {
+    options = page.locator('[role="listbox"] [role="option"], [role="listbox"] button');
+  }
+
+  await options.first().waitFor({ state: 'visible', timeout: 10000 });
+  const count = await options.count();
+  if (count === 0) {
+    throw new Error(`No options found for combobox: ${name}`);
+  }
+
+  const index = Math.floor(Math.random() * count);
+  const option = options.nth(index);
+  console.log(`${name} -> [${index + 1}/${count}] ${(await option.textContent())?.trim()}`);
+  await option.click();
+}
+
 test('Propexcel end-to-end flow', async ({ page, context }) => {
   const data = generateTestData();
   const moveInDate = formatMoveInDate();
@@ -86,42 +109,15 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       {
 
           await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").click();
-      }
-      {
-
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").click();
-      }
-      {
-
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").click();
-      }
-      {
-
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").fill('M');
-      }
-      {
-
-          await page.keyboard.up('m');
-      }
-      {
-
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").fill('Maa E');
-      }
-      {
-
-          await page.keyboard.up('e');
-      }
-      {
-
           await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").fill(data.propertyName);
       }
       {
 
-          await page.locator("div.lg\\:grid-cols-4 > div:nth-of-type(1) div.flex-1").click();
+          await selectRandomFromCombobox(page, 'Select category');
       }
       {
 
-          await page.locator("div.lg\\:grid-cols-4 > div:nth-of-type(2) div.flex-1").click();
+          await selectRandomFromCombobox(page, 'Select property group');
       }
       {
 
@@ -146,6 +142,10 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       {
 
           await page.getByRole('textbox', { name: 'Rental price for Monthly' }).fill('10000');
+      }
+      {
+
+          await selectRandomFromCombobox(page, 'Select Tax');
       }
       {
 
