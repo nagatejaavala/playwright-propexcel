@@ -1,0 +1,24 @@
+{
+  "name": "playwright-project",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test:chrome": "npx playwright test --project=chrome --headed",
+    "test:chrome-nightly": "npx playwright test --project=chrome-nightly --headed"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@playwright/test": "^1.62.0-alpha-2026-07-03",
+    "@types/node": "^26.1.0",
+    "@types/nodemailer": "^8.0.1"
+  },
+  "dependencies": {
+    "imapflow": "^1.7.1",
+    "mailparser": "^3.9.15",
+    "nodemailer": "^9.0.5"
+  }
+}
