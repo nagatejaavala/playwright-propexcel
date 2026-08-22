@@ -6,6 +6,7 @@ import {
   resolveTenantCredentials,
   startYopmailCredentialPolling,
 } from "../utils/TenantCredentials";
+import { saveSharedTenantData } from "../utils/SharedTenantData";
 
 function generateTestData() {
   const suffix = Date.now().toString().slice(-6);
@@ -36,15 +37,47 @@ async function selectRandomFromCombobox(
   }
 
   await options.first().waitFor({ state: 'visible', timeout: 10000 });
+  // Brief settle — list can re-render and detach option nodes
+  await page.waitForTimeout(300);
+  options = page.getByRole('option');
+  if ((await options.count()) === 0) {
+    options = page.locator('[role="listbox"] [role="option"], [role="listbox"] button');
+  }
+
   const count = await options.count();
   if (count === 0) {
     throw new Error(`No options found for combobox: ${name}`);
   }
 
   const index = Math.floor(Math.random() * count);
-  const option = options.nth(index);
-  console.log(`${name} -> [${index + 1}/${count}] ${(await option.textContent())?.trim()}`);
-  await option.click();
+  const label = ((await options.nth(index).textContent()) || '').trim();
+  console.log(`${name} -> [${index + 1}/${count}] ${label}`);
+
+  // Prefer stable re-query by visible text (avoids detached DOM mid-click)
+  const byText = page.getByRole('option', { name: label, exact: true }).first();
+  if (await byText.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await byText.click({ force: true });
+  } else {
+    await options.nth(index).click({ force: true });
+  }
+
+  // Ensure list closed before next combobox
+  await page.keyboard.press('Escape').catch(() => undefined);
+  await page.waitForTimeout(200);
+}
+
+async function fillLoginFields(
+  page: import('@playwright/test').Page,
+  orgId: string,
+  email: string,
+  password: string,
+) {
+  const org = page.getByRole('textbox', { name: /Organization ID/i }).or(page.locator('#tenantId'));
+  const emailField = page.getByRole('textbox', { name: /Email Address/i }).or(page.locator('#email'));
+  const passwordField = page.getByRole('textbox', { name: /^Password$/i }).or(page.locator('#password'));
+  await org.first().fill(orgId);
+  await emailField.first().fill(email);
+  await passwordField.first().fill(password);
 }
 
 test('Propexcel end-to-end flow', async ({ page, context }) => {
@@ -61,35 +94,10 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       {
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-      }
-      {
-
-          await page.locator("#tenantId").click();
-      }
-      {
-
-          await page.locator("#tenantId").fill('test240');
-      }
-      {
-
-          await page.locator("#email").click();
-      }
-      {
-
-          await page.locator("#email").fill('test240@yopmail.com');
-      }
-      {
-
-          await page.locator("#password").click();
-      }
-      {
-
-          await page.locator("#password").fill('Test2026$');
-      }
-      {
-
-          await page.keyboard.press('Enter');
-          await page.getByRole('heading', { name: 'Properties' }).waitFor();
+          await page.getByRole('heading', { name: /Welcome Back/i }).waitFor({ timeout: 30000 });
+          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await page.getByRole('button', { name: 'Sign In' }).click();
+          await page.getByRole('heading', { name: 'Properties' }).waitFor({ timeout: 60000 });
       }
       {
 
@@ -214,7 +222,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
             await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
             await page.locator('h4').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().click();
           }
-          await page.getByRole('heading', { name: 'Deal Details' }).waitFor({ timeout: 30000 });
+          await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
       }
       {
 
@@ -354,9 +362,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           if (tenantCredentials.password) {
             await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-            await page.locator('#tenantId').fill('test240');
-            await page.locator('#email').fill(data.email);
-            await page.locator('#password').fill(tenantCredentials.password);
+            await fillLoginFields(page, 'test240', data.email, tenantCredentials.password);
             await page.getByRole('button', { name: 'Sign In' }).click();
 
             const invalidCredentials = page.getByText('Invalid credentials');
@@ -372,8 +378,9 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
               console.log('Login failed — retrying with fresh YOPmail fetch');
               const retryCredentials = await getTenantCredentialsFromYopmail(page, data.email);
               tenantPassword = retryCredentials.password;
-              await page.locator('#password').fill('');
-              await page.locator('#password').fill(retryCredentials.password!);
+              const passwordField = page.getByRole('textbox', { name: /^Password$/i }).or(page.locator('#password'));
+              await passwordField.first().fill('');
+              await passwordField.first().fill(retryCredentials.password!);
               await page.getByRole('button', { name: 'Sign In' }).click();
             }
           } else if (tenantCredentials.loginLink?.includes('test.propexcel.com')) {
@@ -400,10 +407,8 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       }
       {
 
-          await page.locator('#tenantId').fill('test240');
-          await page.locator('#email').fill('test240@yopmail.com');
-          await page.locator('#password').fill('Test2026$');
-          await page.keyboard.press('Enter');
+          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await page.getByRole('button', { name: 'Sign In' }).click();
           await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
       }
       {
@@ -513,9 +518,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           }
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-          await page.locator('#tenantId').fill('test240');
-          await page.locator('#email').fill(data.email);
-          await page.locator('#password').fill(tenantPassword);
+          await fillLoginFields(page, 'test240', data.email, tenantPassword);
           await page.getByRole('button', { name: 'Sign In' }).click();
           await page.waitForURL(
             (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
@@ -598,6 +601,20 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           await page.bringToFront();
           await expect(page.getByText(/^PAID$/i).first()).toBeVisible({ timeout: 60000 });
       }
+
+  if (!tenantPassword) {
+    throw new Error('Cannot save shared tenant data — password is missing.');
+  }
+
+  saveSharedTenantData({
+    fullName: data.fullName,
+    email: data.email,
+    mobile: data.mobile,
+    propertyName: data.propertyName,
+    password: tenantPassword,
+    orgId: 'test240',
+    moveInDate,
+  });
 
   passwordCapture.dispose();
 });

@@ -21,15 +21,20 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   /* Force one worker for serial execution */
   workers: 1,
-  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: 'html',
+  /* Reporter: console + HTML report for every run */
+  reporter: [
+    ['list'],
+    ['html', { open: 'never' }],
+  ],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     /* Base URL to use in actions like `await page.goto('')`. */
     // baseURL: 'http://localhost:3000',
 
-    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
-    trace: 'on-first-retry',
+    /* Always capture artifacts for pass and fail */
+    screenshot: 'on',
+    video: 'on',
+    trace: 'on',
     /* Disable viewport to maximize browser window */
     viewport: null,
     /* Pre-grant location so the browser permission popup does not block login */
