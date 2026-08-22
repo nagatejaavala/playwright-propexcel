@@ -66,6 +66,104 @@ async function selectRandomFromCombobox(
   await page.waitForTimeout(200);
 }
 
+async function payViaRazorpayNetbanking(
+  page: import('@playwright/test').Page,
+  context: import('@playwright/test').BrowserContext,
+) {
+  const razorpayFrame = page.frameLocator('iframe.razorpay-checkout-frame, iframe[src*="razorpay"]').first();
+  await razorpayFrame.getByText(/Payment Options|Netbanking|UPI/i).first()
+    .waitFor({ state: 'visible', timeout: 30000 });
+
+  async function continuePaymentIfExitPrompt() {
+    const continueBtn = razorpayFrame.getByRole('button', { name: /Continue to payment/i });
+    if (await continueBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await continueBtn.click();
+      await page.waitForTimeout(500);
+    }
+  }
+
+  await continuePaymentIfExitPrompt();
+
+  // Select Netbanking from sidebar — click label row (avoid Close Checkout / force radio misfires)
+  const netbankingLabel = razorpayFrame.getByText('Netbanking', { exact: true });
+  await netbankingLabel.waitFor({ state: 'visible', timeout: 15000 });
+  await netbankingLabel.click();
+
+  await continuePaymentIfExitPrompt();
+
+  // Netbanking panel — Suggested Banks or bank search list
+  const netbankingReady = razorpayFrame.getByText(/Suggested Banks|Search for Banks|Bank of Baroda/i).first();
+  if (!await netbankingReady.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await razorpayFrame.getByRole('radio', { name: /Netbanking/i }).click();
+    await continuePaymentIfExitPrompt();
+  }
+  await netbankingReady.waitFor({ state: 'visible', timeout: 20000 });
+
+  // Click suggested Bank of Baroda row to open Razorpay test bank page
+  const suggestedBankBtn = razorpayFrame
+    .getByRole('heading', { name: 'Suggested Banks' })
+    .locator('xpath=following::*[@role="button"][contains(., "Bank of Baroda")][1]');
+
+  let bankPage: import('@playwright/test').Page | null = null;
+  try {
+    [bankPage] = await Promise.all([
+      context.waitForEvent('page', { timeout: 60000 }),
+      suggestedBankBtn.evaluate((el) => (el as HTMLElement).click()),
+    ]);
+  } catch {
+    // Fallback: click the whole suggested bank row container
+    const bankRow = razorpayFrame.getByRole('radio', {
+      name: /Bank of Baroda - Retail Banking.*For Individuals/i,
+    }).locator('xpath=ancestor::*[@cursor="pointer" or contains(@class,"cursor")][1]');
+    try {
+      [bankPage] = await Promise.all([
+        context.waitForEvent('page', { timeout: 30000 }),
+        bankRow.evaluate((el) => (el as HTMLElement).click()),
+      ]);
+    } catch {
+      bankPage = null;
+    }
+  }
+
+  async function clickSuccessOnAnyPage(): Promise<boolean> {
+    const pages = context.pages();
+    for (const p of pages) {
+      const successBtn = p.getByRole('button', { name: /^Success$/i });
+      if (await successBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await successBtn.click({ force: true });
+        await p.waitForEvent('close', { timeout: 30000 }).catch(() => undefined);
+        return true;
+      }
+    }
+    const frameSuccess = razorpayFrame.getByRole('button', { name: /^Success$/i });
+    if (await frameSuccess.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await frameSuccess.click({ force: true });
+      return true;
+    }
+    return false;
+  }
+
+  if (bankPage) {
+    await bankPage.waitForLoadState('domcontentloaded');
+    await bankPage.getByRole('button', { name: /^Success$/i }).click({ force: true });
+    await bankPage.waitForEvent('close', { timeout: 30000 }).catch(() => undefined);
+  } else {
+    // Poll — test bank may open in a new tab slightly delayed
+    const deadline = Date.now() + 45000;
+    let clicked = false;
+    while (Date.now() < deadline && !clicked) {
+      clicked = await clickSuccessOnAnyPage();
+      if (!clicked) await page.waitForTimeout(1000);
+    }
+    if (!clicked) {
+      throw new Error('Razorpay test bank Success button not found after selecting Bank of Baroda');
+    }
+  }
+
+  await page.bringToFront();
+  await expect(page.getByText(/^PAID$/i).first()).toBeVisible({ timeout: 60000 });
+}
+
 async function fillLoginFields(
   page: import('@playwright/test').Page,
   orgId: string,
@@ -601,39 +699,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           await page.getByRole('button', { name: /Pay Online/i }).click();
           await page.getByRole('button', { name: /Pay with Razorpay/i }).click();
 
-          // Razorpay checkout iframe — UPI is default; select Netbanking via sidebar radio
-          const razorpayFrame = page.frameLocator('iframe.razorpay-checkout-frame, iframe[src*="razorpay"]').first();
-          await razorpayFrame.getByText(/Payment Options|Netbanking|UPI/i).first()
-            .waitFor({ state: 'visible', timeout: 30000 });
-
-          const netbankingRadio = razorpayFrame.getByRole('radio', { name: /Netbanking/i });
-          await netbankingRadio.click({ force: true, timeout: 15000 });
-          await razorpayFrame.getByText(/Suggested Banks|Search for Banks|Bank of Baroda/i).first()
-            .waitFor({ state: 'visible', timeout: 15000 });
-
-          const bankPopupPromise = context.waitForEvent('page', { timeout: 45000 }).catch(() => null);
-
-          // Click a suggested bank button (avoid obscured radios in the method list)
-          const bankBtn = razorpayFrame.getByRole('button', { name: /Bank of Baroda - Retail Banking/i }).first();
-          await bankBtn.scrollIntoViewIfNeeded();
-          await bankBtn.click({ force: true });
-
-          const bankPage = await bankPopupPromise;
-          if (bankPage) {
-            await bankPage.waitForLoadState('domcontentloaded');
-            await bankPage.getByRole('button', { name: 'Success' }).click();
-            await bankPage.waitForEvent('close', { timeout: 30000 }).catch(() => {});
-          } else {
-            // Fallback: Success button on same page / another razorpay frame
-            if (await page.getByRole('button', { name: 'Success' }).isVisible({ timeout: 8000 }).catch(() => false)) {
-              await page.getByRole('button', { name: 'Success' }).click();
-            } else {
-              await razorpayFrame.getByRole('button', { name: 'Success' }).click({ timeout: 10000 });
-            }
-          }
-
-          await page.bringToFront();
-          await expect(page.getByText(/^PAID$/i).first()).toBeVisible({ timeout: 60000 });
+          await payViaRazorpayNetbanking(page, context);
       }
 
   if (!tenantPassword) {
