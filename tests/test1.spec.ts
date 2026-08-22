@@ -80,6 +80,54 @@ async function fillLoginFields(
   await passwordField.first().fill(password);
 }
 
+async function fillInvoiceLineItemWithRentalIncome(
+  page: import('@playwright/test').Page,
+  amount: string,
+) {
+  const lineItemDialog = page.getByRole('dialog').filter({ hasText: /Line Item/i }).last();
+  await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 15000 });
+
+  const itemField = lineItemDialog.getByLabel(/^Item$/i);
+  if (await itemField.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await itemField.fill('rent');
+  }
+
+  // Chart of Account — open combobox (default is often 1000 - Cash)
+  const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i);
+  const chartCombo = lineItemDialog.getByRole('combobox').filter({
+    hasText: /1000 - Cash|4000 - Rental Income|Chart of Account/i,
+  }).first();
+
+  if (await chartCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await chartCombo.click();
+  } else if (await chartLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
+  } else {
+    await lineItemDialog.getByText(/1000 - Cash \(Asset/i).click();
+  }
+
+  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
+  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
+  await accountSearch.fill('4000');
+
+  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
+    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i))
+    .or(page.getByRole('option', { name: /4000\s*-\s*Rental Income/i }))
+    .or(page.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i));
+
+  await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
+  await rentalIncome.first().click();
+  console.log('Chart of Account -> 4000 - Rental Income');
+
+  const amountField = lineItemDialog.getByLabel(/Amount.*Incl.*Tax/i)
+    .or(lineItemDialog.getByPlaceholder('0.00'))
+    .or(lineItemDialog.locator('div.grid input').first());
+  await amountField.first().fill(amount);
+
+  await lineItemDialog.getByRole('button', { name: /^Save$/i }).click();
+  await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+}
+
 test('Propexcel end-to-end flow', async ({ page, context }) => {
   const data = generateTestData();
   const moveInDate = formatMoveInDate();
@@ -427,22 +475,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           const addLineItemBtn = page.getByRole('button', { name: 'Add Line Item' });
           if (await addLineItemBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
             await addLineItemBtn.click();
-            const lineItemDialog = page.getByRole('dialog').last();
-            await lineItemDialog.getByRole('textbox').first().fill('rent');
-            const rentOption = lineItemDialog.getByText(/rent/i).last();
-            if (await rentOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-              await rentOption.click();
-            }
-            const accountPicker = lineItemDialog.getByText(/1000 - Cash \(Asset/i);
-            if (await accountPicker.isVisible({ timeout: 3000 }).catch(() => false)) {
-              await accountPicker.click();
-            }
-            const accountSearch = lineItemDialog.getByRole('textbox', { name: 'Search...' }).last();
-            if (await accountSearch.isVisible({ timeout: 3000 }).catch(() => false)) {
-              await accountSearch.fill('4000');
-            }
-            await lineItemDialog.locator('div.grid input').first().fill('10000');
-            await lineItemDialog.getByRole('button', { name: 'Save' }).click();
+            await fillInvoiceLineItemWithRentalIncome(page, '10000');
           } else {
             await page.locator('button.h-9.rounded-md.px-3.w-full.sm\\:w-auto').click();
             const amountInput = page.getByPlaceholder('0.00');
@@ -568,13 +601,14 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           await page.getByRole('button', { name: /Pay Online/i }).click();
           await page.getByRole('button', { name: /Pay with Razorpay/i }).click();
 
-          // Razorpay checkout iframe
+          // Razorpay checkout iframe — UPI is default; select Netbanking via sidebar radio
           const razorpayFrame = page.frameLocator('iframe.razorpay-checkout-frame, iframe[src*="razorpay"]').first();
           await razorpayFrame.getByText(/Payment Options|Netbanking|UPI/i).first()
             .waitFor({ state: 'visible', timeout: 30000 });
 
-          await razorpayFrame.getByText('Netbanking', { exact: true }).click();
-          await razorpayFrame.getByText(/Suggested Banks|Search for Banks/i).first()
+          const netbankingRadio = razorpayFrame.getByRole('radio', { name: /Netbanking/i });
+          await netbankingRadio.click({ force: true, timeout: 15000 });
+          await razorpayFrame.getByText(/Suggested Banks|Search for Banks|Bank of Baroda/i).first()
             .waitFor({ state: 'visible', timeout: 15000 });
 
           const bankPopupPromise = context.waitForEvent('page', { timeout: 45000 }).catch(() => null);
