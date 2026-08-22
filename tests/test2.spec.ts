@@ -124,16 +124,15 @@ async function pickFromOpenedList(
   return selected;
 }
 
-async function fieldCombobox(page: Page, fieldLabel: string) {
-  // Label text sits next to the combobox in the same parent block
-  const labeled = page.getByRole('combobox', { name: new RegExp(`^${fieldLabel}$`, 'i') });
-  if (await labeled.first().isVisible({ timeout: 1500 }).catch(() => false)) {
-    return labeled.first();
+async function comboboxForLabel(scope: Locator, label: string): Promise<Locator> {
+  const labelPattern = new RegExp(`^${escapeRegExp(label)}\\s*\\*?$`, 'i');
+  const byRole = scope.getByRole('combobox', { name: new RegExp(`^${label}`, 'i') });
+  if (await byRole.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+    return byRole.first();
   }
 
-  return page
-    .getByText(new RegExp(`^${fieldLabel}\\s*\\*?$`, 'i'))
-    .locator('xpath=following::*[(@role="combobox") or self::select][1]');
+  const labelEl = scope.getByText(labelPattern, { exact: true }).first();
+  return labelEl.locator('xpath=following::*[@role="combobox"][1]');
 }
 
 async function selectFormDropdown(
@@ -141,8 +140,22 @@ async function selectFormDropdown(
   labelText: string,
   fieldName: string,
   preferred?: string,
+  scope?: Locator,
 ): Promise<string> {
-  const combo = await fieldCombobox(page, labelText);
+  const root = scope ?? page;
+  const combo = await comboboxForLabel(root, labelText);
+  await openCombobox(page, combo);
+  return pickFromOpenedList(page, fieldName, preferred);
+}
+
+async function selectTaskDialogDropdown(
+  page: Page,
+  taskDialog: Locator,
+  comboHint: RegExp,
+  fieldName: string,
+  preferred?: string,
+): Promise<string> {
+  const combo = taskDialog.getByRole('combobox').filter({ hasText: comboHint }).first();
   await openCombobox(page, combo);
   return pickFromOpenedList(page, fieldName, preferred);
 }
@@ -165,14 +178,15 @@ async function selectVendorCategory(page: Page, category: string): Promise<strin
 
 /**
  * Flow 2 — uses tenant created by Flow 1 (tests/test1.spec.ts).
- * Request category and Vendor category use the same rotating shared value.
+ * Tenant request → vendor → operations task on submitted request.
  * Run together:
  *   npx playwright test tests/test1.spec.ts tests/test2.spec.ts --headed
  */
-test('Propexcel Flow 2 — tenant request then create vendor', async ({ page }) => {
+test('Propexcel Flow 2 — tenant request, vendor, and operations task', async ({ page }) => {
   const tenant = loadSharedTenantData();
   const suffix = randomSuffix();
   const requestTitle = `Request ${suffix}`;
+  const taskTitle = `Task ${suffix}`;
   const sharedCategory = nextSharedCategory();
   const vendor = {
     name: `Vendor ${suffix}`,
@@ -196,7 +210,7 @@ test('Propexcel Flow 2 — tenant request then create vendor', async ({ page }) 
   console.log('Flow 2 shared category:', sharedCategory);
   console.log('Flow 2 vendor data:', vendor);
 
-  test.setTimeout(300_000);
+  test.setTimeout(600_000);
   page.setDefaultTimeout(30_000);
 
   // 1) Login as tenant from Flow 1
@@ -295,4 +309,55 @@ test('Propexcel Flow 2 — tenant request then create vendor', async ({ page }) 
     category: vendorCategory,
     matchedRequestCategory: selectedCategory === vendorCategory,
   });
+
+  // 8) Operations → Requests
+  await page.goto('https://test.propexcel.com/operations', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: /Operations Dashboard/i }).waitFor({ timeout: 15000 });
+  await page.getByRole('button', { name: 'Requests', exact: true }).click();
+  await page.waitForURL(/\/operations\/requests/, { timeout: 15000 });
+  await page.getByRole('heading', { name: /^Requests$/i }).waitFor({ timeout: 15000 });
+
+  // 9) Open submitted request from this run
+  const requestCard = page.getByText(new RegExp(`^${escapeRegExp(requestTitle)}$`, 'i')).first();
+  await requestCard.waitFor({ state: 'visible', timeout: 30000 });
+  await requestCard.click();
+  await page.getByRole('heading', { name: new RegExp(requestTitle, 'i') }).waitFor({ timeout: 15000 });
+
+  // 10) Start Progress
+  await page.getByRole('button', { name: /Start Progress/i }).click();
+
+  // 11) Add task
+  await page.getByRole('button', { name: /Add task/i }).click();
+
+  const taskDialog = page.getByRole('dialog', { name: /Add Task/i });
+  await taskDialog.getByRole('heading', { name: /Add Task/i }).waitFor({ timeout: 15000 });
+
+  await taskDialog.getByRole('textbox', { name: /Title/i }).fill(taskTitle);
+
+  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status/i, 'Task Status', 'Open');
+  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority');
+  const assignedVendor = await selectTaskDialogDropdown(
+    page,
+    taskDialog,
+    /Not Assigned|Select vendor/i,
+    'Assign to Vendor',
+    new RegExp(escapeRegExp(vendor.name), 'i'),
+  );
+
+  // 12) Save Task
+  await taskDialog.getByRole('button', { name: /^Save Task$/i }).click();
+
+  await expect(page.getByText(new RegExp(taskTitle, 'i')).first()).toBeVisible({ timeout: 30000 });
+  console.log('Task created:', {
+    title: taskTitle,
+    status: taskStatus,
+    priority: taskPriority,
+    vendor: assignedVendor,
+  });
+
+  // 13) Left sidebar → Tasks
+  await page.getByRole('button', { name: /^Tasks$/i }).click();
+  await page.waitForURL(/\/operations\/tasks/, { timeout: 15000 });
+  await expect(page.getByText(new RegExp(taskTitle, 'i')).first()).toBeVisible({ timeout: 30000 });
+  console.log('Task visible on Tasks page:', taskTitle);
 });
