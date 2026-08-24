@@ -44,3 +44,30 @@ export function loadSharedOrgData(): SharedOrgData {
 export function getSharedOrgDataPath(): string {
   return DATA_FILE;
 }
+
+/** Prefer org.json from CreateOrganization; fall back to test240 for legacy runs. */
+export function getAdminLoginCredentials(): {
+  orgId: string;
+  email: string;
+  password: string;
+  orgName?: string;
+  source: 'org.json' | 'fallback-test240';
+} {
+  if (fs.existsSync(DATA_FILE)) {
+    const data = loadSharedOrgData();
+    return {
+      orgId: data.orgId,
+      email: data.email,
+      password: data.password,
+      orgName: data.orgName,
+      source: 'org.json',
+    };
+  }
+  return {
+    orgId: 'test240',
+    email: 'test240@yopmail.com',
+    password: 'Test2026$',
+    orgName: 'Super Admin',
+    source: 'fallback-test240',
+  };
+}

@@ -34,42 +34,109 @@ async function fillInAnyFrame(page: Page, selectors: string[], value: string): P
   return false;
 }
 
+async function findComplete3DSButton(page: Page) {
+  const pages = page.context().pages();
+  for (const p of pages) {
+    for (const frame of p.frames()) {
+      const btn = frame.getByRole('button', { name: /^(COMPLETE|Complete)$/i }).first();
+      if (await btn.isVisible({ timeout: 250 }).catch(() => false)) {
+        return btn;
+      }
+    }
+    const pageBtn = p.getByRole('button', { name: /^(COMPLETE|Complete)$/i }).first();
+    if (await pageBtn.isVisible({ timeout: 250 }).catch(() => false)) {
+      return pageBtn;
+    }
+  }
+  return null;
+}
+
+async function is3DSChallengeVisible(page: Page): Promise<boolean> {
+  for (const p of page.context().pages()) {
+    for (const frame of p.frames()) {
+      if (await frame.getByRole('heading', { name: /3D Secure/i }).isVisible({ timeout: 200 }).catch(() => false)) {
+        return true;
+      }
+      if (await frame.getByRole('button', { name: /^(COMPLETE|Complete)$/i }).isVisible({ timeout: 200 }).catch(() => false)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Click Stripe 3DS COMPLETE and wait until the challenge closes (retry if needed). */
 async function clickComplete3DS(page: Page): Promise<void> {
-  const deadline = Date.now() + 60000;
+  const deadline = Date.now() + 90000;
+  let clickedOnce = false;
+
   while (Date.now() < deadline) {
-    const pageBtn = page.getByRole('button', { name: /^COMPLETE$/i });
-    if (await pageBtn.isVisible({ timeout: 500 }).catch(() => false)) {
-      await pageBtn.click();
+    const btn = await findComplete3DSButton(page);
+    if (btn) {
+      await btn.click({ force: true }).catch(async () => {
+        await btn.evaluate((el) => (el as HTMLElement).click());
+      });
+      clickedOnce = true;
+      console.log('3D Secure COMPLETE clicked');
+
+      await page.waitForTimeout(2500);
+      if (!(await is3DSChallengeVisible(page))) {
+        console.log('3D Secure challenge closed');
+        return;
+      }
+      console.log('3D Secure still visible — retrying COMPLETE');
+      continue;
+    }
+
+    // No button right now — if challenge already gone after a prior click, success
+    if (clickedOnce && !(await is3DSChallengeVisible(page))) {
+      console.log('3D Secure challenge closed');
       return;
     }
 
-    for (const frame of page.frames()) {
-      const btn = frame.getByRole('button', { name: /^COMPLETE$/i });
-      if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
-        await btn.click();
-        return;
-      }
+    await page.waitForTimeout(1000);
+  }
+
+  if (!clickedOnce) {
+    throw new Error('3D Secure COMPLETE button not found');
+  }
+  throw new Error('3D Secure COMPLETE clicked but challenge did not close');
+}
+
+/** After Stripe payment, wait until PropExcel login is ready (retry 3DS if it reappears). */
+async function waitForLoginAfterStripe(page: Page): Promise<void> {
+  const deadline = Date.now() + 180000;
+  const welcome = page.getByRole('heading', { name: /Welcome Back/i });
+
+  while (Date.now() < deadline) {
+    if (
+      page.url().includes('test.propexcel.com') &&
+      page.url().includes('/login') &&
+      (await welcome.isVisible({ timeout: 500 }).catch(() => false))
+    ) {
+      return;
     }
 
-    const pages = page.context().pages();
-    for (const p of pages) {
-      const btn = p.getByRole('button', { name: /^COMPLETE$/i });
-      if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
-        await btn.click();
-        return;
-      }
-      for (const frame of p.frames()) {
-        const fBtn = frame.getByRole('button', { name: /^COMPLETE$/i });
-        if (await fBtn.isVisible({ timeout: 300 }).catch(() => false)) {
-          await fBtn.click();
-          return;
-        }
+    if (await welcome.isVisible({ timeout: 500 }).catch(() => false)) {
+      return;
+    }
+
+    // Stripe sometimes re-shows 3DS or click didn't stick
+    if (await is3DSChallengeVisible(page)) {
+      const btn = await findComplete3DSButton(page);
+      if (btn) {
+        await btn.click({ force: true }).catch(async () => {
+          await btn.evaluate((el) => (el as HTMLElement).click());
+        });
+        console.log('3D Secure COMPLETE re-clicked while waiting for login');
+        await page.waitForTimeout(2000);
       }
     }
 
     await page.waitForTimeout(1000);
   }
-  throw new Error('3D Secure COMPLETE button not found');
+
+  throw new Error('Timed out waiting for login page after Stripe 3DS / Subscribe');
 }
 
 /**
@@ -201,12 +268,11 @@ test('Create Organization — register new org and save login data', async ({ pa
 
   await page.getByRole('button', { name: /^Subscribe$/i }).click();
 
-  // 14) 3D Secure → COMPLETE
+  // 14) 3D Secure → COMPLETE (retry until challenge closes)
   await clickComplete3DS(page);
-  console.log('3D Secure COMPLETE clicked');
 
-  // Wait until login page appears
-  await page.waitForURL(/\/login/, { timeout: 120000 });
+  // Wait until PropExcel login appears (re-click 3DS if it comes back)
+  await waitForLoginAfterStripe(page);
   await expect(page.getByRole('heading', { name: /Welcome Back/i })).toBeVisible({ timeout: 30000 });
   console.log('Returned to login page after organization registration');
 
