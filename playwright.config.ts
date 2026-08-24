@@ -33,9 +33,13 @@ export default defineConfig({
 
     /* Always capture artifacts for pass and fail */
     screenshot: 'on',
-    video: 'on',
+    /* Explicit video size so recording works even with maximized window */
+    video: {
+      mode: 'on',
+      size: { width: 1920, height: 1080 },
+    },
     trace: 'on',
-    /* Disable viewport to maximize browser window */
+    /* null = use full maximized OS window (avoids small boxed viewport) */
     viewport: null,
     /* Pre-grant location so the browser permission popup does not block login */
     permissions: ['geolocation'],
@@ -52,7 +56,6 @@ export default defineConfig({
       name: 'chromium',
       use: {
         browserName: 'chromium',
-        viewport: null,
       },
     },
     // {
