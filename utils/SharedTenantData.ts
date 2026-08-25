@@ -31,7 +31,7 @@ export function saveSharedTenantData(
 export function loadSharedTenantData(): SharedTenantData {
   if (!fs.existsSync(DATA_FILE)) {
     throw new Error(
-      `Shared tenant data not found at ${DATA_FILE}. Run Flow 1 (tests/test1.spec.ts) first.`,
+      `Shared tenant data not found at ${DATA_FILE}. Run Flow 1 (tests/Flow1-ExistingOrganization.spec.ts) first.`,
     );
   }
   const raw = fs.readFileSync(DATA_FILE, 'utf-8');
