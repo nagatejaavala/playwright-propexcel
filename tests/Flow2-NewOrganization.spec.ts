@@ -265,11 +265,79 @@ async function selectBillCombobox(
   return pickFromOpenedList(page, fieldName, preferred);
 }
 
+/**
+ * Bill Chart of Account: search by vendor category; if no match, search "6" and pick random.
+ */
+async function selectChartOfAccountByVendorCategory(
+  page: Page,
+  root: Locator,
+  category: string,
+): Promise<string> {
+  const chartLabel = root.getByText(/^Chart of Account$/i);
+  const chartCombo = root.getByRole('combobox').filter({
+    hasText: /Select Expense Account|Select account|Cash|Service Revenue|Chart of Account|4100|1000|4000|6\d{3}/i,
+  }).first()
+    .or(root.getByRole('combobox').first());
+
+  if (await chartCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await openCombobox(page, chartCombo);
+  } else if (await chartLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
+  }
+
+  const accountSearch = root.getByRole('textbox', { name: /Search/i }).last()
+    .or(page.getByRole('textbox', { name: /Search/i }).last());
+  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
+
+  const catQuery = category.trim();
+  await accountSearch.fill('');
+  await accountSearch.fill(catQuery);
+  await page.waitForTimeout(400);
+
+  const options = dropdownOptionLocator(page);
+  const catRe = new RegExp(escapeRegExp(catQuery), 'i');
+  let matchedCount = 0;
+  const visibleCount = await options.count();
+  for (let i = 0; i < visibleCount; i++) {
+    const text = ((await options.nth(i).textContent()) || '').trim();
+    if (text && catRe.test(text)) {
+      matchedCount++;
+    }
+  }
+
+  if (matchedCount > 0) {
+    for (let i = 0; i < visibleCount; i++) {
+      const text = ((await options.nth(i).textContent()) || '').trim();
+      if (text && catRe.test(text)) {
+        await options.nth(i).click();
+        console.log(`Chart of Account (by category "${catQuery}") -> ${text}`);
+        return text;
+      }
+    }
+  }
+
+  // Fallback: search "6" → pick any random option
+  await accountSearch.fill('');
+  await accountSearch.fill('6');
+  await page.waitForTimeout(400);
+  await options.first().waitFor({ state: 'visible', timeout: 10000 });
+  const fallbackCount = await options.count();
+  if (fallbackCount === 0) {
+    throw new Error(`Chart of Account: no options for category "${catQuery}" or fallback search "6"`);
+  }
+  const idx = Math.floor(Math.random() * fallbackCount);
+  const picked = ((await options.nth(idx).textContent()) || '').trim();
+  await options.nth(idx).click();
+  console.log(`Chart of Account (fallback search "6", category was "${catQuery}") -> ${picked}`);
+  return picked;
+}
+
 async function fillBillLineItem(
   page: Page,
   itemName: string,
   quantity: string,
   unitPrice: string,
+  vendorCategory: string,
 ) {
   const lineItemDialog = page.getByRole('dialog').filter({ hasText: /Line Item/i }).last();
   await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 15000 });
@@ -289,31 +357,7 @@ async function fillBillLineItem(
   await priceField.first().click();
   await priceField.first().fill(unitPrice);
 
-  // Chart of Account → 4100 - Service Revenue
-  const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i);
-  const chartCombo = lineItemDialog.getByRole('combobox').filter({
-    hasText: /Select Expense Account|Cash|Service Revenue|Chart of Account|4100|1000/i,
-  }).first();
-
-  if (await chartCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await openCombobox(page, chartCombo);
-  } else if (await chartLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
-  }
-
-  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
-  if (await accountSearch.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await accountSearch.fill('4100');
-  }
-
-  const serviceRevenue = lineItemDialog.getByRole('option', { name: /4100\s*-\s*Service Revenue/i })
-    .or(lineItemDialog.getByText(/4100\s*-\s*Service Revenue/i))
-    .or(page.getByRole('option', { name: /4100\s*-\s*Service Revenue/i }))
-    .or(page.getByText(/4100\s*-\s*Service Revenue/i));
-
-  await serviceRevenue.first().waitFor({ state: 'visible', timeout: 10000 });
-  await serviceRevenue.first().click();
-  console.log('Chart of Account -> 4100 - Service Revenue');
+  await selectChartOfAccountByVendorCategory(page, lineItemDialog, vendorCategory);
 
   // Tax — pick a real tax if available, else keep / select any option
   const taxCombo = lineItemDialog.getByRole('combobox').filter({
@@ -343,7 +387,7 @@ async function fillBillLineItem(
   await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
 }
 
-async function fillInvoiceLineItemWithServiceRevenue(
+async function fillInvoiceLineItemWithRentalIncome(
   page: Page,
   itemName: string,
   amount: string,
@@ -372,16 +416,16 @@ async function fillInvoiceLineItemWithServiceRevenue(
 
   const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
   await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
-  await accountSearch.fill('4100');
+  await accountSearch.fill('4000');
 
-  const serviceRevenue = lineItemDialog.getByRole('option', { name: /4100\s*-\s*Service Revenue/i })
-    .or(lineItemDialog.getByText(/4100\s*-\s*Service Revenue/i))
-    .or(page.getByRole('option', { name: /4100\s*-\s*Service Revenue/i }))
-    .or(page.getByText(/4100\s*-\s*Service Revenue/i));
+  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000/i }).first()
+    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income/i))
+    .or(page.getByRole('option', { name: /4000/i }).first())
+    .or(page.getByText(/4000\s*-\s*Rental Income/i));
 
-  await serviceRevenue.first().waitFor({ state: 'visible', timeout: 10000 });
-  await serviceRevenue.first().click();
-  console.log('Invoice Chart of Account -> 4100 - Service Revenue');
+  await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
+  await rentalIncome.first().click();
+  console.log('Invoice Chart of Account -> 4000');
 
   const amountField = lineItemDialog.getByLabel(/Amount.*Incl.*Tax/i)
     .or(lineItemDialog.getByPlaceholder('0.00'))
@@ -843,7 +887,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   const billItemName = itemNameForCategory(sharedCategory);
   const quantity = String(1 + Math.floor(Math.random() * 5));
   const unitPrice = String(100 + Math.floor(Math.random() * 900));
-  await fillBillLineItem(page, billItemName, quantity, unitPrice);
+  await fillBillLineItem(page, billItemName, quantity, unitPrice, vendorCategory);
 
   console.log('Bill line item saved:', {
     reference: refNo,
@@ -855,7 +899,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
     item: billItemName,
     quantity,
     unitPrice,
-    chartOfAccount: '4100 - Service Revenue',
+    chartOfAccount: `by vendor category: ${vendorCategory}`,
   });
 
   // 42) Submit Bill
@@ -929,29 +973,11 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   await page.getByRole('button', { name: /Make Payment\s*\(/i }).click();
 
-  // 46) Confirm Payment → Chart of Account 4100 - Service Revenue
+  // 46) Confirm Payment → Chart of Account by vendor category
   const confirmDialog = page.getByRole('dialog').filter({ hasText: /Confirm Payment/i });
   await confirmDialog.waitFor({ state: 'visible', timeout: 15000 });
 
-  const accountCombo = confirmDialog.getByRole('combobox').filter({
-    hasText: /Select account|Chart of Account|4100|Cash|Service Revenue/i,
-  }).first()
-    .or(confirmDialog.getByRole('combobox').first());
-
-  await openCombobox(page, accountCombo);
-  const accountSearch = confirmDialog.getByRole('textbox', { name: /Search/i })
-    .or(page.getByRole('textbox', { name: /Search/i }).last());
-  if (await accountSearch.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await accountSearch.fill('4100');
-  }
-
-  const serviceRevenue = confirmDialog.getByRole('option', { name: /4100\s*-\s*Service Revenue/i })
-    .or(confirmDialog.getByText(/4100\s*-\s*Service Revenue/i))
-    .or(page.getByRole('option', { name: /4100\s*-\s*Service Revenue/i }))
-    .or(page.getByText(/4100\s*-\s*Service Revenue/i));
-  await serviceRevenue.first().waitFor({ state: 'visible', timeout: 10000 });
-  await serviceRevenue.first().click();
-  console.log('Payment Chart of Account -> 4100 - Service Revenue');
+  await selectChartOfAccountByVendorCategory(page, confirmDialog, vendorCategory);
 
   // 47) Confirm Payment
   await confirmDialog.getByRole('button', { name: /Confirm Payment/i }).click();
@@ -982,11 +1008,11 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   await tenantOption.waitFor({ state: 'visible', timeout: 15000 });
   await tenantOption.click();
 
-  // 51–54) Line item from this run's bill (item, amount, 4100)
+  // 51–54) Line item from this run's bill (item, amount, Chart of Account 4000)
   const addLineItemBtn = page.getByRole('button', { name: 'Add Line Item' });
   if (await addLineItemBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
     await addLineItemBtn.click();
-    await fillInvoiceLineItemWithServiceRevenue(page, billItemName, invoiceAmount);
+    await fillInvoiceLineItemWithRentalIncome(page, billItemName, invoiceAmount);
   } else {
     await page.locator('button.h-9.rounded-md.px-3.w-full.sm\\:w-auto').click();
     const amountInput = page.getByPlaceholder('0.00');

@@ -392,6 +392,110 @@ async function configureTaxSettings(page: import('@playwright/test').Page) {
   await page.getByRole('heading', { name: 'Properties' }).waitFor({ timeout: 30000 });
 }
 
+/** Admin → Approval Workflows → create Deal Approve workflow (CRM / deals). */
+async function configureDealApprovalWorkflow(page: import('@playwright/test').Page) {
+  await dismissEndToEndFlowTour(page);
+  await dismissNotificationsModal(page);
+
+  await clickTopNavModule(page, 'Admin');
+  await dismissEndToEndFlowTour(page);
+  await dismissNotificationsModal(page);
+
+  const approvalNav = page.getByRole('button', { name: /^Approval Workflows$/i })
+    .or(page.getByRole('link', { name: /^Approval Workflows$/i }))
+    .or(page.locator('[data-testid="sidebar-item"]').filter({ hasText: /Approval Workflows/i }))
+    .first();
+  await approvalNav.waitFor({ state: 'attached', timeout: 20000 });
+  await approvalNav.click({ force: true }).catch(async () => {
+    await approvalNav.evaluate((el) => (el as HTMLElement).click());
+  });
+  await page.getByRole('heading', { name: /Approval Workflows/i }).waitFor({ timeout: 20000 });
+
+  // Prior run may already have Deal Approve — skip recreate
+  const existingDealApprove = page.getByText(/Deal Approve/i).first();
+  if (await existingDealApprove.isVisible({ timeout: 8000 }).catch(() => false)) {
+    console.log('Deal Approve workflow already exists — skipping create');
+    return;
+  }
+
+  await page.getByRole('button', { name: /\+?\s*Create New Workflow/i }).click();
+  await page.getByText(/Loading workflow configuration/i)
+    .waitFor({ state: 'hidden', timeout: 60000 })
+    .catch(() => undefined);
+  await page.getByRole('heading', { name: /Edit Workflow Configuration|Workflow Configuration/i })
+    .first()
+    .waitFor({ timeout: 30000 });
+
+  // + Create Step → Add New Step
+  await page.getByRole('button', { name: /\+?\s*Create Step/i }).click();
+  const stepDialog = page.getByRole('dialog').filter({ hasText: /Add New Step/i });
+  await stepDialog.waitFor({ state: 'visible', timeout: 15000 });
+
+  const stepName = stepDialog.getByLabel(/Step Name/i)
+    .or(stepDialog.getByRole('textbox', { name: /Step Name/i }))
+    .first();
+  await stepName.fill('');
+  await stepName.fill('Internal Approval');
+
+  const approverType = stepDialog.getByRole('combobox', { name: /Approver Type/i })
+    .or(stepDialog.getByText(/Approver Type/i).locator('xpath=following::*[@role="combobox"][1]'))
+    .first();
+  await approverType.click();
+  await page.getByRole('option', { name: /User \(Employee\)/i }).click();
+
+  const employeeCombo = stepDialog.getByRole('combobox', { name: /Employee|Role/i })
+    .or(stepDialog.getByText(/^(Employee|Role)/i).locator('xpath=following::*[@role="combobox"][1]'))
+    .first();
+  await employeeCombo.click();
+
+  // Custom Employee/Roles dropdown (search + radio) — select "Super Admin"
+  const roleSearch = page.getByPlaceholder(/Search/i).last();
+  if (await roleSearch.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await roleSearch.fill('Super Admin');
+  }
+  const superAdmin = page.getByText('Super Admin', { exact: true }).last();
+  await superAdmin.waitFor({ state: 'visible', timeout: 15000 });
+  await superAdmin.click();
+  // Close multi-select dropdown so Add Step is clickable
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(300);
+
+  const addStepBtn = page.getByRole('button', { name: /^Add Step$/i }).last();
+  await addStepBtn.scrollIntoViewIfNeeded();
+  await addStepBtn.click({ force: true });
+  await stepDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  await page.getByText(/Add New Step/i).first().waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+
+  // Workflow Configuration: Module CRM, Feature deals, name Deal Approve, Enabled
+  const moduleCombo = page.getByRole('combobox', { name: /Select a module|Module/i })
+    .or(page.getByText(/^Module/i).locator('xpath=following::*[@role="combobox"][1]'))
+    .first();
+  await moduleCombo.scrollIntoViewIfNeeded();
+  await moduleCombo.click();
+  await page.getByRole('option', { name: /^CRM$/i }).click();
+
+  const featureCombo = page.getByRole('combobox', { name: /Feature|Select module first/i })
+    .or(page.getByText(/^Feature/i).locator('xpath=following::*[@role="combobox"][1]'))
+    .first();
+  await featureCombo.click();
+  await page.getByRole('option', { name: /deals/i }).first().click();
+
+  const workflowName = page.getByLabel(/Workflow Name/i)
+    .or(page.getByRole('textbox', { name: /Workflow Name/i }))
+    .first();
+  await workflowName.fill('');
+  await workflowName.fill('Deal Approve');
+
+  const enabled = page.getByRole('radio', { name: /Workflow Enabled/i })
+    .or(page.getByText(/Workflow Enabled/i));
+  await enabled.first().click();
+
+  // Prefer the Workflow Configuration form Save (not the canvas toolbar Save)
+  await page.getByRole('button', { name: /Save Changes/i }).last().click();
+  await page.getByText(/saved|success|updated|created/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
+  console.log('Deal Approve workflow saved (CRM / deals)');
+}
+
 async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: string) {
   const byHint = profileHint
     ? page.getByRole('button', { name: new RegExp(profileHint, 'i') })
@@ -549,6 +653,16 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
       }
       {
           await configureTaxSettings(page);
+      }
+      {
+          // Admin → Approval Workflows → Deal Approve (before Create Property)
+          await configureDealApprovalWorkflow(page);
+          await clickTopNavModule(page, 'Property');
+          await page.getByRole('button', { name: /^Properties$/i })
+            .or(page.getByRole('link', { name: /^Properties$/i }))
+            .first()
+            .click();
+          await page.getByRole('heading', { name: 'Properties' }).waitFor({ timeout: 30000 });
       }
       {
 

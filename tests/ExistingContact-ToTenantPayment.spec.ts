@@ -1,3 +1,11 @@
+/**
+ * Existing Contact → Tenant Payment
+ * Login (org.json) → Admin Approval Workflow (Deal Approve) → CRM existing contact → lead/deal → tenant → rent pay.
+ * Super Admin login comes from Create Organization (test-data/org.json).
+ *
+ * Run:
+ *   npx playwright test tests/CreateOrganization.spec.ts tests/ExistingContact-ToTenantPayment.spec.ts --headed
+ */
 import { test, expect } from "@playwright/test";
 import {
   captureTenantPasswordFromDialog,
@@ -6,7 +14,9 @@ import {
   resolveTenantCredentials,
   startYopmailCredentialPolling,
 } from "../utils/TenantCredentials";
-import { saveSharedTenantData } from "../utils/SharedTenantData";
+import { saveSharedTenantDataNewOrg } from "../utils/SharedTenantData";
+import { loadSharedOrgData } from "../utils/SharedOrgData";
+import { loadSharedCrmData } from "../utils/SharedCrmData";
 
 function generateTestData() {
   const suffix = Date.now().toString().slice(-6);
@@ -178,6 +188,279 @@ async function fillLoginFields(
   await passwordField.first().fill(password);
 }
 
+/** Dismiss new-org onboarding tour modal (PropExcel End-to-End Flow) if it appears after login. */
+async function dismissEndToEndFlowTour(page: import('@playwright/test').Page) {
+  const popover = page.locator('#driver-popover-content, .driver-popover, [role="dialog"].flow-popover').first();
+  const title = page.getByText(/PropExcel End-to-End Flow/i).first();
+  const iframeTour = page.locator('iframe[src*="propexcel-end-to-end-flow"]').first();
+
+  const visible =
+    (await title.isVisible({ timeout: 8000 }).catch(() => false)) ||
+    (await popover.isVisible({ timeout: 1000 }).catch(() => false)) ||
+    (await iframeTour.isVisible({ timeout: 1000 }).catch(() => false));
+  if (!visible) return;
+
+  // Escape often closes driver.js popovers
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(400);
+
+  // Click X / Close on popover if still present
+  const closeBtn = page.locator(
+    '#driver-popover-content button, .driver-popover button, [role="dialog"].flow-popover button',
+  ).filter({ hasText: /close|skip|done|×|x/i })
+    .or(page.locator('.driver-popover-close-btn, button[aria-label*="Close" i]'))
+    .first();
+
+  if (await closeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+    await closeBtn.click({ force: true });
+  } else if (await popover.isVisible({ timeout: 500 }).catch(() => false)) {
+    // Remove overlay via DOM if UI close fails
+    await page.evaluate(() => {
+      document.querySelectorAll(
+        '#driver-popover-content, .driver-popover, .driver-overlay, iframe[src*="propexcel-end-to-end-flow"]',
+      ).forEach((el) => el.remove());
+      document.body.classList.remove('driver-active', 'driver-fade');
+    });
+  }
+
+  await title.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
+  await popover.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => undefined);
+  console.log('Dismissed PropExcel End-to-End Flow tour');
+}
+
+/** Close Notifications & Announcements overlay if it blocks the UI. */
+async function dismissNotificationsModal(page: import('@playwright/test').Page) {
+  const title = page.getByText(/Notifications\s*&\s*Announcements/i).first();
+  if (!(await title.isVisible({ timeout: 3000 }).catch(() => false))) return;
+
+  const dialog = page.getByRole('dialog').filter({ hasText: /Notifications\s*&\s*Announcements/i }).first();
+  const root = (await dialog.isVisible().catch(() => false)) ? dialog : title.locator('xpath=ancestor::div[.//button][1]');
+  const closeBtn = root
+    .getByRole('button', { name: /close|cancel/i })
+    .or(root.locator('button[aria-label*="Close" i]'))
+    .or(root.locator('button').filter({ hasText: /^[×x✕]$/i }))
+    .first();
+
+  if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await closeBtn.click();
+  } else {
+    await page.keyboard.press('Escape');
+  }
+  await title.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+  console.log('Dismissed Notifications & Announcements modal');
+}
+
+/** Click a top-nav module button (Property / Admin / CRM / …) via aria-label — often not "visible" to Playwright. */
+async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabel: string) {
+  const btn = page.locator(`button[aria-label="${ariaLabel}"]`).first();
+  await btn.waitFor({ state: 'attached', timeout: 15000 });
+  await btn.evaluate((el) => (el as HTMLElement).click());
+}
+
+/** Ensure GST (5%) exists under Accounts → Taxes so deal tax dropdown can select it. */
+async function ensureGst5PercentTax(page: import('@playwright/test').Page) {
+  await dismissEndToEndFlowTour(page);
+  await dismissNotificationsModal(page);
+
+  await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 });
+
+  const gst5Row = page.getByRole('row').filter({ hasText: /GST\s*\(\s*5\s*%\s*\)/i }).first();
+  if (await gst5Row.isVisible({ timeout: 5000 }).catch(() => false)) {
+    console.log('GST (5%) tax already exists — skipping create');
+    return;
+  }
+
+  await page.getByRole('button', { name: /\+?\s*Create New Tax/i }).first().click();
+  await page.getByRole('heading', { name: /Create New Tax|Create.*Tax|New Tax|Tax Information/i })
+    .first()
+    .waitFor({ timeout: 20000 });
+
+  const taxName = page.getByRole('textbox', { name: /e\.g\., TAX, Service Tax|Tax Name/i })
+    .or(page.getByPlaceholder(/TAX, Service Tax|Tax Name/i))
+    .first();
+  const taxCode = page.getByRole('textbox', { name: /e\.g\., TAX-001|Tax Code/i })
+    .or(page.getByPlaceholder(/TAX-001|Tax Code/i))
+    .first();
+  const taxPct = page.getByRole('spinbutton', { name: /e\.g\., 5\.00|Tax Percentage/i })
+    .or(page.getByPlaceholder(/5\.00|Tax Percentage/i))
+    .or(page.locator('input[type="number"]').first())
+    .first();
+
+  await taxName.fill('GST (5%)');
+  await taxCode.fill('GST-05');
+  await taxPct.fill('5');
+  await page.getByRole('button', { name: /Create Tax/i }).first().click();
+  await page.getByText(/GST\s*\(\s*5\s*%\s*\)|GST-05/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
+  console.log('Tax settings saved: GST (5%) / GST-05 / 5%');
+}
+
+/**
+ * Deal property card: if rent is 0, set random rent (120000–600000), discount (10–30%),
+ * select tax, Save → Mark as site visit → Submit for Approval.
+ */
+async function fillDealPropertyPricingAndSubmit(page: import('@playwright/test').Page, propertyName: string) {
+  const propertyCard = page.locator('h4', { hasText: propertyName })
+    .locator('xpath=ancestor::div[contains(@class,"rounded-2xl")]').first()
+    .or(page.locator('div.rounded-2xl').filter({ hasText: propertyName }).first());
+  await propertyCard.waitFor({ state: 'visible', timeout: 15000 });
+  await propertyCard.scrollIntoViewIfNeeded();
+
+  // PROPERTY RENT
+  const rentInput = propertyCard.getByRole('spinbutton', { name: /PROPERTY RENT|Property Rent/i })
+    .or(propertyCard.getByLabel(/PROPERTY RENT|Property Rent/i))
+    .or(propertyCard.locator('input[type="number"], input[inputmode="decimal"], input[inputmode="numeric"]').first())
+    .first();
+  await rentInput.waitFor({ state: 'visible', timeout: 10000 });
+  const rentRaw = ((await rentInput.inputValue().catch(() => '0')) || '0').replace(/,/g, '').trim();
+  const rentValue = Number(rentRaw) || 0;
+  if (rentValue === 0) {
+    const rent = Math.floor(120000 + Math.random() * (600000 - 120000 + 1));
+    await rentInput.click();
+    await rentInput.fill('');
+    await rentInput.fill(String(rent));
+    console.log('Set property rent:', rent);
+  } else {
+    console.log('Property rent already set:', rentValue);
+  }
+
+  // DISCOUNT (%) — 10 to 30
+  const discount = Math.floor(10 + Math.random() * (30 - 10 + 1));
+  const discountInput = propertyCard.getByRole('spinbutton', { name: /DISCOUNT\s*\(%\)|Discount\s*\(%\)/i })
+    .or(propertyCard.getByLabel(/DISCOUNT\s*\(%\)|Discount\s*\(%\)/i))
+    .or(propertyCard.locator('input[type="number"], input[inputmode="decimal"], input[inputmode="numeric"]').nth(1))
+    .first();
+  if (await discountInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await discountInput.click();
+    await discountInput.fill('');
+    await discountInput.fill(String(discount));
+    console.log('Set discount %:', discount);
+  }
+
+  // TAX % dropdown — always select GST (5%)
+  const taxCombobox = propertyCard.getByRole('combobox').first();
+  if (await taxCombobox.isVisible({ timeout: 5000 }).catch(() => false)) {
+    const taxLabel = ((await taxCombobox.textContent()) || '').trim();
+    if (!taxLabel || /No selection/i.test(taxLabel) || !/GST\s*\(\s*5\s*%\s*\)/i.test(taxLabel)) {
+      await taxCombobox.click();
+      const taxOption = page.getByRole('option', { name: /GST\s*\(\s*5\s*%\s*\)/i }).first();
+      await taxOption.waitFor({ state: 'visible', timeout: 10000 });
+      await taxOption.click();
+      console.log('Selected deal property tax: GST (5%)');
+    }
+  }
+
+  await propertyCard.getByRole('button', { name: /^Save$/i }).click();
+  await page.getByText(/saved|success|updated/i).first().waitFor({ timeout: 10000 }).catch(() => undefined);
+  console.log('Deal property pricing saved');
+
+  const siteVisitBtn = page.getByRole('button', { name: /Mark as site visit/i }).first();
+  await siteVisitBtn.waitFor({ state: 'visible', timeout: 15000 });
+  await siteVisitBtn.click();
+  console.log('Clicked Mark as site visit');
+  const siteVisitDialog = page.getByRole('dialog');
+  if (await siteVisitDialog.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await siteVisitDialog.getByRole('button', { name: /Confirm|Yes|Submit|Save|OK/i }).click().catch(() => undefined);
+    await siteVisitDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+  }
+
+  const submitForApproval = page.getByRole('button', { name: /Submit for Approval/i }).first();
+  await submitForApproval.waitFor({ state: 'visible', timeout: 15000 });
+  await submitForApproval.click();
+  console.log('Clicked Submit for Approval');
+  const submitDialog = page.getByRole('dialog');
+  if (await submitDialog.isVisible({ timeout: 4000 }).catch(() => false)) {
+    await submitDialog.getByRole('button', { name: /Submit|Approve|Confirm|Yes/i }).click();
+    await submitDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  }
+}
+
+/**
+ * After Submit for Approval: scroll to Approval Workflow → Internal Approval → Approve.
+ * Matches PropExcel deal page when Deal Approve workflow is enabled.
+ */
+async function approveDealViaApprovalWorkflow(page: import('@playwright/test').Page) {
+  // Prefer "Submit for Approval" (workflow-enabled UI); fall back to legacy "Approve Deal"
+  // Skip if already submitted from fillDealPropertyPricingAndSubmit
+  const submitForApproval = page.getByRole('button', { name: /Submit for Approval/i }).first();
+  const approveDealBtn = page.getByRole('button', { name: /^Approve Deal$/i }).first();
+  const approveBtnEarly = page.getByRole('button', { name: /^Approve$/i }).first();
+
+  if (await approveBtnEarly.isVisible({ timeout: 3000 }).catch(() => false)) {
+    console.log('Approve already available — skipping Submit for Approval');
+  } else if (await submitForApproval.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await submitForApproval.click();
+    console.log('Clicked Submit for Approval');
+  } else if (await approveDealBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await approveDealBtn.click();
+    console.log('Clicked Approve Deal');
+  }
+
+  // Optional confirm dialog (Submit / Approve / Confirm)
+  const confirmDialog = page.getByRole('dialog');
+  if (await confirmDialog.isVisible({ timeout: 4000 }).catch(() => false)) {
+    await confirmDialog.getByRole('button', { name: /Submit|Approve|Confirm|Yes/i }).click();
+    await confirmDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  }
+
+  await page.getByText(/Deal property submitted successfully|Approval In Progress|submitted successfully/i)
+    .first()
+    .waitFor({ state: 'visible', timeout: 20000 })
+    .catch(() => undefined);
+
+  // Approval Workflow panel → Internal Approval → Approve
+  const workflowSection = page.getByText(/Approval Workflow/i).first();
+  await workflowSection.waitFor({ state: 'visible', timeout: 30000 });
+  await workflowSection.scrollIntoViewIfNeeded();
+
+  // Wait for workflow to finish loading / leave Preview-NOT INITIATED if possible
+  await page.getByText(/Loading workflow/i).waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
+  await page.getByText(/IN PROGRESS|Your Action Required/i).first()
+    .waitFor({ state: 'visible', timeout: 30000 })
+    .catch(() => undefined);
+
+  // If still "Submit for Approval", click again after tax/property save
+  const submitAgain = page.getByRole('button', { name: /Submit for Approval/i }).first();
+  if (await submitAgain.isVisible({ timeout: 2000 }).catch(() => false)) {
+    await submitAgain.click();
+    console.log('Re-clicked Submit for Approval');
+    await page.waitForTimeout(1500);
+  }
+
+  const approveBtn = page.getByRole('button', { name: /^Approve$/i }).first();
+  await approveBtn.waitFor({ state: 'visible', timeout: 30000 });
+  await approveBtn.scrollIntoViewIfNeeded();
+  await approveBtn.click();
+  console.log('Clicked Approve on Internal Approval step');
+
+  const confirmApprove = page.getByRole('button', { name: /^Confirm$/i }).first();
+  if (await confirmApprove.isVisible({ timeout: 8000 }).catch(() => false)) {
+    await confirmApprove.click();
+    console.log('Clicked Confirm on approval step');
+  }
+
+  // Wait until workflow shows APPROVED / COMPLETED
+  await page.getByText(/APPROVED|COMPLETED ON|Create Contract|View Contract/i)
+    .first()
+    .waitFor({ state: 'visible', timeout: 60000 });
+  console.log('Deal approval workflow completed');
+}
+
+async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: string) {
+  const byHint = profileHint
+    ? page.getByRole('button', { name: new RegExp(profileHint, 'i') })
+    : page.getByRole('button', { name: /Super Admin/i });
+  if (await byHint.first().isVisible({ timeout: 5000 }).catch(() => false)) {
+    await byHint.first().click();
+  } else if (await page.getByRole('button', { name: /Super Admin/i }).first().isVisible({ timeout: 2000 }).catch(() => false)) {
+    await page.getByRole('button', { name: /Super Admin/i }).first().click();
+  } else {
+    await page.locator('header').getByRole('button').last().click();
+  }
+  await page.getByText('Logout', { exact: true }).click();
+  await page.waitForURL(/\/login/, { timeout: 15000 });
+}
+
 async function fillInvoiceLineItemWithRentalIncome(
   page: import('@playwright/test').Page,
   amount: string,
@@ -226,13 +509,28 @@ async function fillInvoiceLineItemWithRentalIncome(
   await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
 }
 
-test('Propexcel end-to-end flow', async ({ page, context }) => {
+test('Existing Contact to Tenant Payment — onboard contact through rent payment (new org)', async ({ page, context }) => {
   const data = generateTestData();
   const moveInDate = formatMoveInDate();
   const passwordCapture = createTenantPasswordCapture(page);
   let yopmailCredentialsPromise: ReturnType<typeof startYopmailCredentialPolling> | undefined;
   let tenantPassword: string | undefined;
-  console.log('Run data:', data, 'Move-in date:', moveInDate);
+  const admin = loadSharedOrgData();
+  const crm = loadSharedCrmData();
+  if (!crm.contacts.length) {
+    throw new Error('No contacts in SharedCrmData — run Creating Contacts,Leads,Deals.spec.ts first.');
+  }
+  const sharedContact = crm.contacts[Math.floor(Math.random() * crm.contacts.length)];
+  data.fullName = sharedContact.fullName;
+  data.email = sharedContact.email;
+  data.mobile = sharedContact.mobile;
+  console.log('Run data (from SharedCrmData contact):', data, 'Move-in date:', moveInDate);
+  console.log('Existing Contact→Payment admin login (from CreateOrganization org.json):', {
+    orgId: admin.orgId,
+    email: admin.email,
+    orgName: admin.orgName,
+  });
+  console.log('Picked shared CRM contact:', sharedContact);
 
   test.setTimeout(600_000);
   page.setDefaultTimeout(30_000);
@@ -241,91 +539,89 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
           await page.getByRole('heading', { name: /Welcome Back/i }).waitFor({ timeout: 30000 });
-          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await fillLoginFields(page, admin.orgId, admin.email, admin.password);
           await page.getByRole('button', { name: 'Sign In' }).click();
-          await page.getByRole('heading', { name: 'Properties' }).waitFor({ timeout: 60000 });
+          await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
+          await dismissEndToEndFlowTour(page);
+          await dismissNotificationsModal(page);
       }
       {
-
-          await page.getByRole('button', { name: '+ Create Property' }).click();
+          // Deal Approve workflow is configured in Flow1-NewOrganization (after tax) — skip here
+          // Ensure GST (5%) exists for deal property tax dropdown
+          await ensureGst5PercentTax(page);
+      }
+      {
+          // CRM → Contacts → open contact from SharedCrmData
           try {
-            await page.waitForURL(/\/property\/properties\/create/, { timeout: 10000 });
+            await clickTopNavModule(page, 'CRM');
+            await page.getByRole('button', { name: /^Contacts$/i })
+              .or(page.getByRole('link', { name: /^Contacts$/i }))
+              .first()
+              .click({ timeout: 10000 });
           } catch {
-            await page.getByRole('button', { name: '+ Create Property' }).click();
-            await page.waitForURL(/\/property\/properties\/create/);
+            await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
           }
-          await page.getByRole('heading', { name: 'Create New Property' }).waitFor();
+          await page.getByRole('heading', { name: 'Contacts Management' }).waitFor({ timeout: 30000 });
+
+          const contactHeading = page.locator('h3')
+            .filter({ hasText: new RegExp(`^${sharedContact.fullName}$`, 'i') })
+            .first();
+          await contactHeading.waitFor({ state: 'visible', timeout: 30000 });
+          console.log('Opening shared contact:', sharedContact.fullName);
+          await contactHeading.click();
       }
       {
+          // Create Lead from contact (Flow1 pattern). Only if duplicate exists, open deals/leads by contact.
+          const openExistingLeadOrDealForContact = async () => {
+            console.log('Lead already exists for contact — opening existing lead/deal:', sharedContact.fullName);
+            const escapedName = sharedContact.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const nameRe = new RegExp(escapedName, 'i');
 
-          await page.getByRole('button', { name: /Office \/ Building/ }).click();
-      }
-      {
-
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").click();
-          await page.locator("div:nth-of-type(1) > div:nth-of-type(1) > input").fill(data.propertyName);
-      }
-      {
-
-          await selectRandomFromCombobox(page, 'Select category');
-      }
-      {
-
-          await selectRandomFromCombobox(page, 'Select property group');
-      }
-      {
-
-          //await page.locator("div.lg\\:grid-cols-4 input").click();
-      }
-      {
-
-         // await page.locator("div.lg\\:grid-cols-4 input").fill('3000');
-         // await page.locator("div.lg\\:grid-cols-4 input").fill('3000');
-          await page.locator("div.lg\\:grid-cols-4 input[type='number']").fill('3000');
-
-
-      }
-      {
-
-          await page.locator("div:nth-of-type(3) > div:nth-of-type(2) > div > div > div").click();
-      }
-      {
-
-          await page.getByRole('textbox', { name: 'Rental price for Monthly' }).click();
-      }
-      {
-
-          await page.getByRole('textbox', { name: 'Rental price for Monthly' }).fill('10000');
-      }
-      {
-
-          await selectRandomFromCombobox(page, 'Select Tax');
-      }
-      {
-
-          await page.getByRole('button', { name: 'Got it' }).click({ timeout: 5000 }).catch(() => {});
-          await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
-          await page.getByRole('heading', { name: 'Contacts Management' }).waitFor();
-          await page.getByRole('button', { name: 'Create Contact' }).click();
-          await page.getByRole('dialog', { name: 'Create New Contact' }).waitFor();
-          await page.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
-          await page.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
-          await page.getByRole('textbox', { name: 'Enter mobile number' }).fill(data.mobile);
-          await page.getByRole('combobox', { name: 'Enter nationality' }).click();
-          await page.getByRole('textbox', { name: 'Search...' }).fill('indian');
-          await page.getByRole('option', { name: 'Indian' }).click();
-          const createDialog = page.getByRole('dialog', { name: 'Create New Contact' });
-          await page.getByRole('button', { name: 'Create Contact' }).click();
-          await createDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(async () => {
-            if (await createDialog.isVisible()) {
-              await createDialog.getByRole('button', { name: 'Close' }).click();
+            // Prefer Deals (lead may already be converted)
+            await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
+            const dealSearch = page.getByPlaceholder(/Search/i).first()
+              .or(page.getByRole('combobox', { name: /Search/i }).first());
+            if (await dealSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+              await dealSearch.fill(sharedContact.fullName);
+              await page.waitForTimeout(1000);
             }
-          });
-          await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().waitFor({ timeout: 15000 });
-      }
-      {
+            const dealCard = page.locator('h3, h4, a').filter({ hasText: nameRe }).first();
+            if (await dealCard.isVisible({ timeout: 10000 }).catch(() => false)) {
+              await dealCard.click();
+              await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
+              return;
+            }
 
-          await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().click();
+            // Else Leads list (clear My Leads + use List view)
+            await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
+            const myLeads = page.getByRole('button', { name: /^My Leads$/i });
+            if (await myLeads.isVisible({ timeout: 3000 }).catch(() => false)) {
+              await myLeads.click();
+              const allLeadsOpt = page.getByRole('option', { name: /All Leads/i })
+                .or(page.getByText(/^All Leads$/i));
+              if (await allLeadsOpt.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+                await allLeadsOpt.first().click();
+              } else {
+                await page.keyboard.press('Escape');
+              }
+            }
+            const listView = page.getByRole('button', { name: /^List$/i });
+            if (await listView.isVisible({ timeout: 3000 }).catch(() => false)) {
+              await listView.click();
+            }
+            const leadSearch = page.getByRole('combobox', { name: /Search by Leads/i })
+              .or(page.getByPlaceholder(/Search/i).first());
+            if (await leadSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+              await leadSearch.fill(sharedContact.email);
+              await page.waitForTimeout(1000);
+            }
+            const leadCard = page.locator('h3, h4, a, td').filter({ hasText: nameRe }).first()
+              .or(page.locator('h3, h4, a, td').filter({ hasText: new RegExp(sharedContact.email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first());
+            await leadCard.waitFor({ state: 'visible', timeout: 30000 });
+            await leadCard.click();
+            await page.waitForURL(/\/crm\/(leads|deals)\/(?!create)/, { timeout: 30000 });
+          };
+
           await page.getByRole('button', { name: 'Create Lead' }).click();
 
           const leadDialog = page.getByRole('dialog').filter({ hasText: 'Create New Lead' });
@@ -347,63 +643,102 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           await expect(submitLeadBtn).toBeVisible();
           await expect(submitLeadBtn).toBeEnabled();
           await submitLeadBtn.click();
+
+          const duplicateLead = page.getByText(/lead with this email and phone number already exists/i);
           try {
-            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 20000 });
+            await page.waitForURL(/\/crm\/leads\/(?!create)/, { timeout: 20000 });
           } catch {
-            await leadForm.press('End');
-            await submitLeadBtn.click({ force: true });
-            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
+            if (await duplicateLead.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await openExistingLeadOrDealForContact();
+            } else {
+              await leadForm.press('End').catch(() => undefined);
+              await submitLeadBtn.click({ force: true });
+              try {
+                await page.waitForURL(/\/crm\/leads\/(?!create)/, { timeout: 45000 });
+              } catch {
+                if (await duplicateLead.isVisible({ timeout: 3000 }).catch(() => false)) {
+                  await openExistingLeadOrDealForContact();
+                } else {
+                  throw new Error('Create Lead failed — did not navigate to lead details and no duplicate message shown');
+                }
+              }
+            }
           }
-          await page.getByRole('button', { name: 'Convert to Deal' }).waitFor({ timeout: 30000 });
+
+          if (!page.url().includes('/crm/deals/')) {
+            await page.getByRole('button', { name: 'Convert to Deal' }).waitFor({ timeout: 30000 });
+          }
       }
       {
 
-          await page.getByRole('button', { name: 'Convert to Deal' }).click();
-          const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
-          await convertDialog.getByRole('combobox', { name: 'Select payment type...' }).click();
-          await page.getByRole('option').first().click();
-          await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
-          await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
+          const convertBtn = page.getByRole('button', { name: 'Convert to Deal' });
+          const alreadyOnDeal = page.url().includes('/crm/deals/')
+            || await page.getByRole('heading', { name: 'Deal Details', level: 1 })
+              .isVisible({ timeout: 2000 })
+              .catch(() => false);
+
+          if (alreadyOnDeal) {
+            console.log('Already on deal details — skipping Convert to Deal');
+          } else if (await convertBtn.isVisible({ timeout: 15000 }).catch(() => false)) {
+            await convertBtn.click();
+            const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
+            await convertDialog.getByRole('combobox', { name: 'Select payment type...' }).click();
+            await page.getByRole('option').first().click();
+            await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
+            await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
+          } else {
+            // Lead already converted — open deal from lead or deals list
+            const viewDeal = page.getByRole('button', { name: /View Deal|Open Deal/i })
+              .or(page.getByRole('link', { name: /View Deal|Open Deal/i }));
+            if (await viewDeal.first().isVisible({ timeout: 5000 }).catch(() => false)) {
+              await viewDeal.first().click();
+            } else {
+              await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
+              await page.locator('h4')
+                .filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') })
+                .first()
+                .click();
+            }
+          }
+
           if (!page.url().includes('/crm/deals/')) {
             await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
-            await page.locator('h4').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().click();
+            await page.locator('h4')
+              .filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') })
+              .first()
+              .click();
           }
           await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
       }
       {
 
-          await page.getByRole('button', { name: 'Add Property' }).click();
-          const addPropertyDialog = page.getByRole('dialog', { name: 'Add Property to Deal' });
-          await addPropertyDialog.getByRole('combobox', { name: 'Search...' }).fill(data.propertyName);
-          const propertyCard = addPropertyDialog.getByRole('heading', { name: data.propertyName });
-          if (await propertyCard.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await propertyCard.click();
+          // Prefer property already on the deal (prior run) — Add Property stays disabled otherwise
+          const propertyOnDeal = page.locator('div.rounded-2xl').filter({ hasText: /PROPERTY RENT|Property Rent/i }).first();
+          if (await propertyOnDeal.isVisible({ timeout: 5000 }).catch(() => false)) {
+            const nameEl = propertyOnDeal.locator('h4').first();
+            data.propertyName = ((await nameEl.textContent()) || '').trim() || data.propertyName;
+            console.log('Deal already has property:', data.propertyName);
           } else {
-            await addPropertyDialog.locator('h3').first().click();
-          }
-          await addPropertyDialog.getByRole('button', { name: 'Add Property' }).click();
-          await addPropertyDialog.waitFor({ state: 'hidden' });
-      }
-      {
-
-          const propertyCard = page.locator('h4', { hasText: data.propertyName }).locator('xpath=ancestor::div[contains(@class,"rounded-2xl")]').first();
-          const taxCombobox = propertyCard.getByRole('combobox');
-          if (await taxCombobox.isVisible({ timeout: 3000 }).catch(() => false)) {
-            const taxLabel = await taxCombobox.textContent();
-            if (!taxLabel || taxLabel.includes('No selection')) {
-              await taxCombobox.click();
-              await page.getByRole('option', { name: 'GST (18%) (18.00%)' }).click();
-              await propertyCard.getByRole('button', { name: 'Save' }).click();
-            }
+            const addPropertyBtn = page.getByRole('button', { name: 'Add Property' }).or(page.getByRole('button', { name: /\+?\s*Add Property/i })).first();
+            await addPropertyBtn.waitFor({ state: 'visible', timeout: 15000 });
+            await addPropertyBtn.click();
+            const addPropertyDialog = page.getByRole('dialog', { name: /Add Property to Deal/i });
+            const existingProperty = addPropertyDialog.locator('h3').first();
+            await existingProperty.waitFor({ state: 'visible', timeout: 15000 });
+            data.propertyName = ((await existingProperty.textContent()) || '').trim() || data.propertyName;
+            console.log('Selected existing property for deal:', data.propertyName);
+            await existingProperty.click();
+            const confirmAdd = addPropertyDialog.getByRole('button', { name: /^Add Property$/i });
+            await expect(confirmAdd).toBeEnabled({ timeout: 15000 });
+            await confirmAdd.click();
+            await addPropertyDialog.waitFor({ state: 'hidden' });
           }
       }
       {
-
-          await page.getByRole('button', { name: 'Approve Deal' }).click();
-          const approveDealDialog = page.getByRole('dialog');
-          if (await approveDealDialog.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await approveDealDialog.getByRole('button', { name: /Approve|Confirm|Yes|Submit/i }).click();
-          }
+          await fillDealPropertyPricingAndSubmit(page, data.propertyName);
+      }
+      {
+          await approveDealViaApprovalWorkflow(page);
       }
       {
 
@@ -486,9 +821,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       }
       {
 
-          await page.getByRole('button', { name: 'Super Admin' }).click();
-          await page.getByText('Logout', { exact: true }).click();
-          await page.waitForURL(/\/login/, { timeout: 15000 });
+          await logoutAdmin(page, admin.orgName);
       }
       {
 
@@ -508,7 +841,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           if (tenantCredentials.password) {
             await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-            await fillLoginFields(page, 'test240', data.email, tenantCredentials.password);
+            await fillLoginFields(page, admin.orgId, data.email, tenantCredentials.password);
             await page.getByRole('button', { name: 'Sign In' }).click();
 
             const invalidCredentials = page.getByText('Invalid credentials');
@@ -553,8 +886,9 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       }
       {
 
-          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await fillLoginFields(page, admin.orgId, admin.email, admin.password);
           await page.getByRole('button', { name: 'Sign In' }).click();
+          await dismissEndToEndFlowTour(page);
           await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
       }
       {
@@ -627,9 +961,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       {
 
           // Logout Super Admin after creating invoice
-          await page.getByRole('button', { name: 'Super Admin' }).click();
-          await page.getByText('Logout', { exact: true }).click();
-          await page.waitForURL(/\/login/, { timeout: 15000 });
+          await logoutAdmin(page, admin.orgName);
       }
       {
 
@@ -649,7 +981,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           }
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-          await fillLoginFields(page, 'test240', data.email, tenantPassword);
+          await fillLoginFields(page, admin.orgId, data.email, tenantPassword);
           await page.getByRole('button', { name: 'Sign In' }).click();
           await page.waitForURL(
             (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
@@ -706,13 +1038,13 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
     throw new Error('Cannot save shared tenant data — password is missing.');
   }
 
-  saveSharedTenantData({
+  saveSharedTenantDataNewOrg({
     fullName: data.fullName,
     email: data.email,
     mobile: data.mobile,
     propertyName: data.propertyName,
     password: tenantPassword,
-    orgId: 'test240',
+    orgId: admin.orgId,
     moveInDate,
   });
 
