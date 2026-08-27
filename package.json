@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test:chrome": "npx playwright test --project=chrome --headed",
-    "test:chrome-nightly": "npx playwright test --project=chrome-nightly --headed"
+    "test:chrome-nightly": "npx playwright test --project=chrome-nightly --headed",
+    "test:full-chain": "bash scripts/run-full-chain.sh"
   },
   "keywords": [],
   "author": "",
