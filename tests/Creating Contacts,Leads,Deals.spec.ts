@@ -43,34 +43,44 @@ async function fillLoginFields(
 }
 
 async function dismissEndToEndFlowTour(page: import('@playwright/test').Page) {
+  const popover = page.locator('#driver-popover-content, .driver-popover, [role="dialog"].flow-popover').first();
   const title = page.getByText(/PropExcel End-to-End Flow/i).first();
-  const visible = await title.isVisible({ timeout: 12000 }).catch(() => false);
+  const iframeTour = page.locator('iframe[src*="propexcel-end-to-end-flow"]').first();
+
+  const visible =
+    (await title.isVisible({ timeout: 8000 }).catch(() => false)) ||
+    (await popover.isVisible({ timeout: 1000 }).catch(() => false)) ||
+    (await iframeTour.isVisible({ timeout: 1000 }).catch(() => false));
   if (!visible) return;
 
   await page.keyboard.press('Escape');
-  if (!(await title.isVisible({ timeout: 1500 }).catch(() => false))) {
-    console.log('Dismissed PropExcel End-to-End Flow tour (Escape)');
-    return;
-  }
+  await page.waitForTimeout(400);
 
-  const dialog = page.getByRole('dialog').filter({ hasText: /PropExcel End-to-End Flow/i }).first();
-  const headerRow = page.locator('div').filter({ hasText: /^PropExcel End-to-End Flow$/ }).first();
-  const closeBtn = dialog
-    .getByRole('button', { name: /close|cancel/i })
-    .or(dialog.locator('button[aria-label*="Close" i], button[aria-label*="close" i]'))
-    .or(headerRow.locator('button').first())
-    .or(title.locator('xpath=following::button[1]'))
+  const closeBtn = page.locator(
+    '#driver-popover-content button, .driver-popover button, [role="dialog"].flow-popover button',
+  ).filter({ hasText: /close|skip|done|×|x/i })
+    .or(page.locator('.driver-popover-close-btn, button[aria-label*="Close" i]'))
     .first();
 
-  if (await closeBtn.count()) {
-    await closeBtn.evaluate((el) => (el as HTMLElement).click()).catch(async () => {
-      await closeBtn.click({ force: true });
-    });
-  } else {
-    await page.keyboard.press('Escape');
+  if (await closeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+    await closeBtn.click({ force: true });
   }
 
-  await title.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+  if (
+    (await popover.isVisible({ timeout: 500 }).catch(() => false)) ||
+    (await iframeTour.isVisible({ timeout: 500 }).catch(() => false)) ||
+    (await title.isVisible({ timeout: 500 }).catch(() => false))
+  ) {
+    await page.evaluate(() => {
+      document.querySelectorAll(
+        '#driver-popover-content, .driver-popover, .driver-overlay, iframe[src*="propexcel-end-to-end-flow"]',
+      ).forEach((el) => el.remove());
+      document.body.classList.remove('driver-active', 'driver-fade');
+    });
+  }
+
+  await title.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
+  await popover.waitFor({ state: 'hidden', timeout: 3000 }).catch(() => undefined);
   console.log('Dismissed PropExcel End-to-End Flow tour');
 }
 
@@ -112,6 +122,8 @@ async function goToCrmContacts(page: import('@playwright/test').Page) {
     await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
   }
   await page.getByRole('heading', { name: 'Contacts Management' }).waitFor({ timeout: 30000 });
+  await dismissEndToEndFlowTour(page);
+  await dismissNotificationsModal(page);
 }
 
 async function goToCrmLeads(page: import('@playwright/test').Page) {
@@ -136,6 +148,7 @@ async function goToCrmLeads(page: import('@playwright/test').Page) {
 
 /** Create Contact — Flow1 contact steps; uses contact* random data. */
 async function createContact(page: import('@playwright/test').Page, data: PersonData) {
+  await dismissEndToEndFlowTour(page);
   await page.getByRole('button', { name: 'Create Contact' }).click();
   await page.getByRole('dialog', { name: 'Create New Contact' }).waitFor();
   await page.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
