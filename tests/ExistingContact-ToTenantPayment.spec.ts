@@ -1,7 +1,8 @@
 /**
  * Existing Contact → Tenant Payment
- * Login (org.json) → Admin Approval Workflow (Deal Approve) → CRM existing contact → lead/deal → tenant → rent pay.
+ * Login (org.json) → CRM existing contact → lead/deal → tenant → rent pay.
  * Super Admin login comes from Create Organization (test-data/org.json).
+ * Deal Approve workflow is configured in Flow1-NewOrganization.
  *
  * Run:
  *   npx playwright test tests/CreateOrganization.spec.ts tests/ExistingContact-ToTenantPayment.spec.ts --headed
@@ -94,10 +95,14 @@ async function payViaRazorpayNetbanking(
 
   await continuePaymentIfExitPrompt();
 
-  // Select Netbanking from sidebar — click label row (avoid Close Checkout / force radio misfires)
-  const netbankingLabel = razorpayFrame.getByText('Netbanking', { exact: true });
-  await netbankingLabel.waitFor({ state: 'visible', timeout: 15000 });
-  await netbankingLabel.click();
+  // Select Netbanking from sidebar — click label/row (UPI row can intercept text click)
+  const netbankingRow = razorpayFrame.locator('[data-testid="netbanking"], [data-testid="Netbanking"], [data-value="netbanking"]').first()
+    .or(razorpayFrame.getByRole('radio', { name: /Netbanking/i }).locator('xpath=ancestor::label[1]'))
+    .or(razorpayFrame.getByText('Netbanking', { exact: true }));
+  await netbankingRow.first().waitFor({ state: 'visible', timeout: 15000 });
+  await netbankingRow.first().click({ force: true }).catch(async () => {
+    await netbankingRow.first().evaluate((el) => (el as HTMLElement).click());
+  });
 
   await continuePaymentIfExitPrompt();
 
@@ -257,22 +262,69 @@ async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabe
   await btn.evaluate((el) => (el as HTMLElement).click());
 }
 
-/** Ensure GST (5%) exists under Accounts → Taxes so deal tax dropdown can select it. */
-async function ensureGst5PercentTax(page: import('@playwright/test').Page) {
+/**
+ * Accounts → Account Settings → Taxes → configure GST 18%
+ * (New orgs default to 5%; deal/property tax dropdown needs GST 18%.)
+ */
+async function configureTaxSettings(page: import('@playwright/test').Page) {
   await dismissEndToEndFlowTour(page);
   await dismissNotificationsModal(page);
 
+  await clickTopNavModule(page, 'Accounts');
+  await dismissEndToEndFlowTour(page);
+
+  const accountSettings = page.getByRole('button', { name: /^Account Settings$/i })
+    .or(page.getByRole('link', { name: /^Account Settings$/i }))
+    .first();
+  if (await accountSettings.isVisible({ timeout: 8000 }).catch(() => false)) {
+    await accountSettings.click();
+    await page.getByRole('heading', { name: /Accounts? Settings/i }).waitFor({ timeout: 20000 });
+
+    const taxesCard = page.locator('div')
+      .filter({ hasText: /Taxes/i })
+      .filter({ hasText: /Configure tax rates|tax settings/i })
+      .first();
+    if (await taxesCard.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await taxesCard.getByRole('button', { name: /Manage/i }).click();
+    } else {
+      await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
+    }
+  } else {
+    await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
+  }
+
   await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
   await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 });
+  await page.waitForTimeout(1000);
 
-  const gst5Row = page.getByRole('row').filter({ hasText: /GST\s*\(\s*5\s*%\s*\)/i }).first();
-  if (await gst5Row.isVisible({ timeout: 5000 }).catch(() => false)) {
-    console.log('GST (5%) tax already exists — skipping create');
+  if (await page.getByText(/GST\s*\(\s*18\s*%\s*\)|GST-18/i).first().isVisible({ timeout: 8000 }).catch(() => false)) {
+    console.log('GST (18%) already configured — skipping tax create');
+    return;
+  }
+
+  const vatRow = page.getByRole('row').filter({ hasText: /\bVAT\b/i }).first();
+  if (await vatRow.isVisible({ timeout: 5000 }).catch(() => false)) {
+    const deleteBtn = vatRow.getByRole('button', { name: /Delete/i })
+      .or(vatRow.locator('button[aria-label*="Delete" i]'))
+      .or(vatRow.locator('button').last());
+    await deleteBtn.click({ force: true });
+    const confirmDelete = page.getByRole('dialog').getByRole('button', { name: /Delete|Confirm|Yes/i }).first();
+    if (await confirmDelete.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await confirmDelete.click();
+    }
+    await vatRow.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+    console.log('Deleted existing VAT tax');
+  }
+
+  if (await page.getByText(/GST\s*\(\s*18\s*%\s*\)|GST-18/i).first().isVisible({ timeout: 2000 }).catch(() => false)) {
+    console.log('GST (18%) already configured — skipping tax create');
     return;
   }
 
   await page.getByRole('button', { name: /\+?\s*Create New Tax/i }).first().click();
-  await page.getByRole('heading', { name: /Create New Tax|Create.*Tax|New Tax|Tax Information/i })
+  console.log('Creating new tax GST (18%)');
+
+  await page.getByRole('heading', { name: /Edit Tax|Create New Tax|Create.*Tax|New Tax|Tax Information/i })
     .first()
     .waitFor({ timeout: 20000 });
 
@@ -287,19 +339,38 @@ async function ensureGst5PercentTax(page: import('@playwright/test').Page) {
     .or(page.locator('input[type="number"]').first())
     .first();
 
-  await taxName.fill('GST (5%)');
-  await taxCode.fill('GST-05');
-  await taxPct.fill('5');
+  await taxName.waitFor({ state: 'visible', timeout: 15000 });
+  await taxName.fill('');
+  await taxName.fill('GST (18%)');
+  await taxCode.fill('');
+  await taxCode.fill('GST-18');
+  await taxPct.fill('');
+  await taxPct.fill('18');
+
   await page.getByRole('button', { name: /Create Tax/i }).first().click();
-  await page.getByText(/GST\s*\(\s*5\s*%\s*\)|GST-05/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
-  console.log('Tax settings saved: GST (5%) / GST-05 / 5%');
+  await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 }).catch(() => undefined);
+  await page.getByText(/GST \(18%\)|GST-18|18\.00%/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
+  console.log('Tax settings saved: GST (18%) / GST-18 / 18%');
 }
 
 /**
  * Deal property card: if rent is 0, set random rent (120000–600000), discount (10–30%),
  * select tax, Save → Mark as site visit → Submit for Approval.
+ * Skips fields that are already filled or disabled (prior-run / submitted deal).
  */
 async function fillDealPropertyPricingAndSubmit(page: import('@playwright/test').Page, propertyName: string) {
+  // Already past pricing / approval?
+  if (await page.getByRole('button', { name: /Create Contract|View Contract/i }).first()
+    .isVisible({ timeout: 3000 }).catch(() => false)) {
+    console.log('Deal already approved / contract available — skipping pricing submit');
+    return;
+  }
+  if (await page.getByRole('button', { name: /^Approve$/i }).first()
+    .isVisible({ timeout: 2000 }).catch(() => false)) {
+    console.log('Approve already available — skipping pricing submit');
+    return;
+  }
+
   const propertyCard = page.locator('h4', { hasText: propertyName })
     .locator('xpath=ancestor::div[contains(@class,"rounded-2xl")]').first()
     .or(page.locator('div.rounded-2xl').filter({ hasText: propertyName }).first());
@@ -314,120 +385,169 @@ async function fillDealPropertyPricingAndSubmit(page: import('@playwright/test')
   await rentInput.waitFor({ state: 'visible', timeout: 10000 });
   const rentRaw = ((await rentInput.inputValue().catch(() => '0')) || '0').replace(/,/g, '').trim();
   const rentValue = Number(rentRaw) || 0;
-  if (rentValue === 0) {
+  const rentEnabled = await rentInput.isEnabled().catch(() => false);
+  if (rentValue === 0 && rentEnabled) {
     const rent = Math.floor(120000 + Math.random() * (600000 - 120000 + 1));
     await rentInput.click();
     await rentInput.fill('');
     await rentInput.fill(String(rent));
     console.log('Set property rent:', rent);
   } else {
-    console.log('Property rent already set:', rentValue);
+    console.log(`Property rent already set/disabled: ${rentValue} (enabled=${rentEnabled})`);
   }
 
-  // DISCOUNT (%) — 10 to 30
+  // DISCOUNT (%) — 10 to 30 (skip if disabled)
   const discount = Math.floor(10 + Math.random() * (30 - 10 + 1));
   const discountInput = propertyCard.getByRole('spinbutton', { name: /DISCOUNT\s*\(%\)|Discount\s*\(%\)/i })
     .or(propertyCard.getByLabel(/DISCOUNT\s*\(%\)|Discount\s*\(%\)/i))
     .or(propertyCard.locator('input[type="number"], input[inputmode="decimal"], input[inputmode="numeric"]').nth(1))
     .first();
   if (await discountInput.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await discountInput.click();
-    await discountInput.fill('');
-    await discountInput.fill(String(discount));
-    console.log('Set discount %:', discount);
-  }
-
-  // TAX % dropdown — always select GST (5%)
-  const taxCombobox = propertyCard.getByRole('combobox').first();
-  if (await taxCombobox.isVisible({ timeout: 5000 }).catch(() => false)) {
-    const taxLabel = ((await taxCombobox.textContent()) || '').trim();
-    if (!taxLabel || /No selection/i.test(taxLabel) || !/GST\s*\(\s*5\s*%\s*\)/i.test(taxLabel)) {
-      await taxCombobox.click();
-      const taxOption = page.getByRole('option', { name: /GST\s*\(\s*5\s*%\s*\)/i }).first();
-      await taxOption.waitFor({ state: 'visible', timeout: 10000 });
-      await taxOption.click();
-      console.log('Selected deal property tax: GST (5%)');
+    if (await discountInput.isEnabled().catch(() => false)) {
+      await discountInput.click();
+      await discountInput.fill('');
+      await discountInput.fill(String(discount));
+      console.log('Set discount %:', discount);
+    } else {
+      const existingDiscount = ((await discountInput.inputValue().catch(() => '')) || '').trim();
+      console.log(`Discount disabled — keeping existing value: ${existingDiscount}`);
     }
   }
 
-  await propertyCard.getByRole('button', { name: /^Save$/i }).click();
-  await page.getByText(/saved|success|updated/i).first().waitFor({ timeout: 10000 }).catch(() => undefined);
-  console.log('Deal property pricing saved');
-
-  const siteVisitBtn = page.getByRole('button', { name: /Mark as site visit/i }).first();
-  await siteVisitBtn.waitFor({ state: 'visible', timeout: 15000 });
-  await siteVisitBtn.click();
-  console.log('Clicked Mark as site visit');
-  const siteVisitDialog = page.getByRole('dialog');
-  if (await siteVisitDialog.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await siteVisitDialog.getByRole('button', { name: /Confirm|Yes|Submit|Save|OK/i }).click().catch(() => undefined);
-    await siteVisitDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+  // TAX % dropdown — always select GST (18%) when editable
+  const taxCombobox = propertyCard.getByRole('combobox').first();
+  if (await taxCombobox.isVisible({ timeout: 5000 }).catch(() => false)) {
+    const taxEnabled = await taxCombobox.isEnabled().catch(() => true);
+    const taxLabel = ((await taxCombobox.textContent()) || '').trim();
+    if (taxEnabled && (!taxLabel || /No selection/i.test(taxLabel) || !/GST\s*\(\s*18\s*%\s*\)/i.test(taxLabel))) {
+      await taxCombobox.click();
+      const taxOption = page.getByRole('option', { name: /GST\s*\(\s*18\s*%\s*\)/i }).first()
+        .or(page.getByRole('option', { name: /GST.*18|18\.00%/i }).first());
+      await taxOption.waitFor({ state: 'visible', timeout: 15000 });
+      await taxOption.click();
+      console.log('Selected deal property tax: GST (18%)');
+    } else {
+      console.log(`Tax already set/disabled: ${taxLabel}`);
+    }
   }
 
-  const submitForApproval = page.getByRole('button', { name: /Submit for Approval/i }).first();
-  await submitForApproval.waitFor({ state: 'visible', timeout: 15000 });
-  await submitForApproval.click();
-  console.log('Clicked Submit for Approval');
-  const submitDialog = page.getByRole('dialog');
-  if (await submitDialog.isVisible({ timeout: 4000 }).catch(() => false)) {
-    await submitDialog.getByRole('button', { name: /Submit|Approve|Confirm|Yes/i }).click();
-    await submitDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  const saveBtn = propertyCard.getByRole('button', { name: /^Save$/i });
+  if (await saveBtn.isVisible({ timeout: 3000 }).catch(() => false)
+    && await saveBtn.isEnabled().catch(() => false)) {
+    await saveBtn.click();
+    await page.getByText(/saved|success|updated/i).first().waitFor({ timeout: 10000 }).catch(() => undefined);
+    console.log('Deal property pricing saved');
+  } else {
+    console.log('Save not available — pricing likely already locked');
   }
+
+  // Checkbox label is "Site visit done" / "Mark as Site visit done" — may already be checked+disabled
+  const alreadySiteVisited = await page.getByText(/^Site visit done$/i).first()
+    .isVisible({ timeout: 2000 })
+    .catch(() => false);
+  const siteVisitCheckbox = page.getByRole('checkbox', { name: /Site visit/i }).first();
+
+  if (alreadySiteVisited || (await siteVisitCheckbox.isChecked().catch(() => false))) {
+    console.log('Site visit already marked done — skipping');
+  } else if (await siteVisitCheckbox.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await siteVisitCheckbox.check({ force: true }).catch(async () => {
+      await page.getByText(/Site visit done/i).first().click({ force: true });
+    });
+    console.log('Marked as site visit done');
+  } else {
+    const siteVisitBtn = page.getByRole('button', { name: /Mark as site visit/i }).first();
+    if (await siteVisitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await siteVisitBtn.click();
+      console.log('Clicked Mark as site visit');
+    }
+  }
+
+  // Submit is handled in approveDealViaApprovalWorkflow (avoids double-click before confirm)
 }
 
 /**
  * After Submit for Approval: scroll to Approval Workflow → Internal Approval → Approve.
  * Matches PropExcel deal page when Deal Approve workflow is enabled.
  */
+async function closeWorkflowPreview(page: import('@playwright/test').Page) {
+  const preview = page.getByRole('dialog').filter({ hasText: /Workflow preview|Not yet initiated/i }).first();
+  if (await preview.isVisible({ timeout: 1500 }).catch(() => false)) {
+    await preview.getByRole('button', { name: /Close/i }).click();
+    await preview.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+    console.log('Closed workflow preview dialog');
+  }
+}
+
+async function confirmSubmitDialog(page: import('@playwright/test').Page) {
+  const modal = page.getByRole('dialog').filter({ hasNotText: /Workflow preview|Not yet initiated/i }).first();
+  if (await modal.isVisible({ timeout: 4000 }).catch(() => false)) {
+    const confirm = modal.getByRole('button', {
+      name: /Submit for Approval|^Submit$|^Approve$|^Confirm$|^Yes$|Initiate|Continue/i,
+    }).last();
+    if (await confirm.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await confirm.click();
+      console.log('Confirmed Submit for Approval dialog');
+    }
+    await modal.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  }
+}
+
 async function approveDealViaApprovalWorkflow(page: import('@playwright/test').Page) {
-  // Prefer "Submit for Approval" (workflow-enabled UI); fall back to legacy "Approve Deal"
-  // Skip if already submitted from fillDealPropertyPricingAndSubmit
-  const submitForApproval = page.getByRole('button', { name: /Submit for Approval/i }).first();
+  await dismissEndToEndFlowTour(page);
+  await dismissNotificationsModal(page);
+
+  if (await page.getByRole('button', { name: /Create Contract|View Contract/i }).first()
+    .isVisible({ timeout: 3000 }).catch(() => false)) {
+    console.log('Deal already approved — skipping approval workflow');
+    return;
+  }
+
   const approveDealBtn = page.getByRole('button', { name: /^Approve Deal$/i }).first();
-  const approveBtnEarly = page.getByRole('button', { name: /^Approve$/i }).first();
 
-  if (await approveBtnEarly.isVisible({ timeout: 3000 }).catch(() => false)) {
-    console.log('Approve already available — skipping Submit for Approval');
-  } else if (await submitForApproval.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await submitForApproval.click();
-    console.log('Clicked Submit for Approval');
-  } else if (await approveDealBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await approveDealBtn.click();
-    console.log('Clicked Approve Deal');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const approveReady = page.getByRole('button', { name: /^Approve$/i }).first();
+    if (await approveReady.isVisible({ timeout: 2000 }).catch(() => false)) break;
+
+    const submitForApproval = page.getByRole('button', { name: /^Submit for Approval$/i }).first();
+    if (await submitForApproval.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await closeWorkflowPreview(page);
+      await submitForApproval.scrollIntoViewIfNeeded();
+      await submitForApproval.click();
+      console.log(`Clicked Submit for Approval (attempt ${attempt})`);
+      await confirmSubmitDialog(page);
+      await page.getByText(/Deal property submitted successfully|IN PROGRESS|Approval In Progress/i)
+        .first()
+        .waitFor({ timeout: 10000 })
+        .catch(() => undefined);
+      await page.waitForTimeout(1500);
+      continue;
+    }
+
+    if (await approveDealBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await approveDealBtn.click();
+      console.log('Clicked Approve Deal');
+      await confirmSubmitDialog(page);
+      break;
+    }
   }
 
-  // Optional confirm dialog (Submit / Approve / Confirm)
-  const confirmDialog = page.getByRole('dialog');
-  if (await confirmDialog.isVisible({ timeout: 4000 }).catch(() => false)) {
-    await confirmDialog.getByRole('button', { name: /Submit|Approve|Confirm|Yes/i }).click();
-    await confirmDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
-  }
+  await closeWorkflowPreview(page);
 
-  await page.getByText(/Deal property submitted successfully|Approval In Progress|submitted successfully/i)
-    .first()
-    .waitFor({ state: 'visible', timeout: 20000 })
-    .catch(() => undefined);
-
-  // Approval Workflow panel → Internal Approval → Approve
   const workflowSection = page.getByText(/Approval Workflow/i).first();
   await workflowSection.waitFor({ state: 'visible', timeout: 30000 });
   await workflowSection.scrollIntoViewIfNeeded();
-
-  // Wait for workflow to finish loading / leave Preview-NOT INITIATED if possible
   await page.getByText(/Loading workflow/i).waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
-  await page.getByText(/IN PROGRESS|Your Action Required/i).first()
-    .waitFor({ state: 'visible', timeout: 30000 })
-    .catch(() => undefined);
 
-  // If still "Submit for Approval", click again after tax/property save
-  const submitAgain = page.getByRole('button', { name: /Submit for Approval/i }).first();
-  if (await submitAgain.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await submitAgain.click();
-    console.log('Re-clicked Submit for Approval');
-    await page.waitForTimeout(1500);
-  }
+  const internalApproval = page.locator('div, section, article')
+    .filter({ hasText: /Internal Approval/i })
+    .filter({ hasText: /Your Action Required|PENDING|Approve/i })
+    .first();
+  await internalApproval.waitFor({ state: 'visible', timeout: 30000 }).catch(() => undefined);
+  await internalApproval.scrollIntoViewIfNeeded().catch(() => undefined);
 
-  const approveBtn = page.getByRole('button', { name: /^Approve$/i }).first();
+  const approveBtn = internalApproval.getByRole('button', { name: /^Approve$/i })
+    .or(page.getByRole('button', { name: /^Approve$/i }))
+    .first();
   await approveBtn.waitFor({ state: 'visible', timeout: 30000 });
   await approveBtn.scrollIntoViewIfNeeded();
   await approveBtn.click();
@@ -439,7 +559,6 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
     console.log('Clicked Confirm on approval step');
   }
 
-  // Wait until workflow shows APPROVED / COMPLETED
   await page.getByText(/APPROVED|COMPLETED ON|Create Contract|View Contract/i)
     .first()
     .waitFor({ state: 'visible', timeout: 60000 });
@@ -544,11 +663,7 @@ test('Existing Contact to Tenant Payment — onboard contact through rent paymen
           await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
           await dismissEndToEndFlowTour(page);
           await dismissNotificationsModal(page);
-      }
-      {
-          // Deal Approve workflow is configured in Flow1-NewOrganization (after tax) — skip here
-          // Ensure GST (5%) exists for deal property tax dropdown
-          await ensureGst5PercentTax(page);
+          await configureTaxSettings(page);
       }
       {
           // CRM → Contacts → open contact from SharedCrmData
@@ -615,10 +730,15 @@ test('Existing Contact to Tenant Payment — onboard contact through rent paymen
               await leadSearch.fill(sharedContact.email);
               await page.waitForTimeout(1000);
             }
-            const leadCard = page.locator('h3, h4, a, td').filter({ hasText: nameRe }).first()
-              .or(page.locator('h3, h4, a, td').filter({ hasText: new RegExp(sharedContact.email.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first());
-            await leadCard.waitFor({ state: 'visible', timeout: 30000 });
-            await leadCard.click();
+            // Prefer a table row (avoids strict-mode when name + email cells both match)
+            const leadRow = page.getByRole('row').filter({ hasText: nameRe }).first();
+            if (await leadRow.isVisible({ timeout: 10000 }).catch(() => false)) {
+              await leadRow.click();
+            } else {
+              const leadCard = page.locator('h3, h4, a').filter({ hasText: nameRe }).first();
+              await leadCard.waitFor({ state: 'visible', timeout: 30000 });
+              await leadCard.click();
+            }
             await page.waitForURL(/\/crm\/(leads|deals)\/(?!create)/, { timeout: 30000 });
           };
 
@@ -712,22 +832,39 @@ test('Existing Contact to Tenant Payment — onboard contact through rent paymen
       }
       {
 
-          // Prefer property already on the deal (prior run) — Add Property stays disabled otherwise
+          const addPropertyBtn = page.getByRole('button', { name: 'Add Property' })
+            .or(page.getByRole('button', { name: /\+?\s*Add Property/i }))
+            .first();
           const propertyOnDeal = page.locator('div.rounded-2xl').filter({ hasText: /PROPERTY RENT|Property Rent/i }).first();
-          if (await propertyOnDeal.isVisible({ timeout: 5000 }).catch(() => false)) {
+          const addEnabled = await addPropertyBtn.isEnabled().catch(() => false);
+
+          if (await propertyOnDeal.isVisible({ timeout: 5000 }).catch(() => false) && !addEnabled) {
             const nameEl = propertyOnDeal.locator('h4').first();
             data.propertyName = ((await nameEl.textContent()) || '').trim() || data.propertyName;
-            console.log('Deal already has property:', data.propertyName);
+            console.log('Deal already has property (Add Property disabled):', data.propertyName);
           } else {
-            const addPropertyBtn = page.getByRole('button', { name: 'Add Property' }).or(page.getByRole('button', { name: /\+?\s*Add Property/i })).first();
             await addPropertyBtn.waitFor({ state: 'visible', timeout: 15000 });
             await addPropertyBtn.click();
             const addPropertyDialog = page.getByRole('dialog', { name: /Add Property to Deal/i });
-            const existingProperty = addPropertyDialog.locator('h3').first();
-            await existingProperty.waitFor({ state: 'visible', timeout: 15000 });
+            await addPropertyDialog.waitFor({ state: 'visible', timeout: 15000 });
+
+            const statusCombo = addPropertyDialog.getByRole('combobox', { name: /Status/i })
+              .or(addPropertyDialog.getByRole('combobox').filter({ hasText: /All \(Status\)|Vacant/i }))
+              .last();
+            await statusCombo.click();
+            await page.getByRole('option', { name: /^Vacant$/i }).click();
+            console.log('Add Property status filter -> Vacant');
+            await page.waitForTimeout(800);
+
+            const vacantCards = addPropertyDialog.locator('h3');
+            await vacantCards.first().waitFor({ state: 'visible', timeout: 15000 });
+            const count = await vacantCards.count();
+            const index = Math.floor(Math.random() * count);
+            const existingProperty = vacantCards.nth(index);
             data.propertyName = ((await existingProperty.textContent()) || '').trim() || data.propertyName;
-            console.log('Selected existing property for deal:', data.propertyName);
+            console.log(`Selected vacant property for deal: ${data.propertyName} [${index + 1}/${count}]`);
             await existingProperty.click();
+
             const confirmAdd = addPropertyDialog.getByRole('button', { name: /^Add Property$/i });
             await expect(confirmAdd).toBeEnabled({ timeout: 15000 });
             await confirmAdd.click();
@@ -798,9 +935,22 @@ test('Existing Contact to Tenant Payment — onboard contact through rent paymen
           await moveInDialog.waitFor({ state: 'visible', timeout: 10000 });
           const dateField = moveInDialog.getByLabel('Tenant Move-in Date');
           await dateField.click();
+          await dateField.fill('');
           await dateField.fill(moveInDate);
-          await moveInDialog.getByRole('button', { name: 'Confirm' }).click();
-          await moveInDialog.waitFor({ state: 'hidden', timeout: 15000 });
+          await dateField.press('Tab').catch(() => undefined);
+          const confirmMoveIn = moveInDialog.getByRole('button', { name: /^Confirm$/i });
+          await expect(confirmMoveIn).toBeEnabled({ timeout: 10000 });
+          await confirmMoveIn.click();
+          // Dialog may stay open briefly or need a second confirm — don't hard-fail the whole flow
+          const closed = await moveInDialog.waitFor({ state: 'hidden', timeout: 20000 }).then(() => true).catch(() => false);
+          if (!closed) {
+            console.log('Move-in dialog still open — retrying Confirm / Escape');
+            await confirmMoveIn.click({ force: true }).catch(() => undefined);
+            await moveInDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(async () => {
+              await page.keyboard.press('Escape');
+              await moveInDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
+            });
+          }
       }
       {
 

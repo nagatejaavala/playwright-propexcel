@@ -301,8 +301,8 @@ async function configureRazorpayIntegration(page: import('@playwright/test').Pag
 }
 
 /**
- * Accounts → Account Settings → Taxes → configure GST 18%
- * (Matches video: edit default tax / create GST so property & deal tax dropdowns work.)
+ * Accounts → Account Settings → Taxes → GST 18%.
+ * Delete default VAT if present; skip create when GST (18%) already exists.
  */
 async function configureTaxSettings(page: import('@playwright/test').Page) {
   await dismissEndToEndFlowTour(page);
@@ -334,54 +334,57 @@ async function configureTaxSettings(page: import('@playwright/test').Page) {
 
   await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 });
 
-  // Edit existing tax (video flow) or Create New Tax
-  const createBtn = page.getByRole('button', { name: /\+?\s*Create New Tax/i }).first();
-  let isEdit = false;
-
-  const existingTaxRow = page.getByRole('row').filter({ hasText: /VAT|GST|%/i }).first();
-  if (await existingTaxRow.isVisible({ timeout: 5000 }).catch(() => false)) {
-    const rowEdit = existingTaxRow.getByRole('button', { name: /Edit/i })
-      .or(existingTaxRow.locator('button[aria-label*="Edit" i]'))
-      .or(existingTaxRow.locator('button').nth(1));
-    await rowEdit.click({ force: true });
-    isEdit = true;
-    console.log('Editing existing tax row');
-  } else {
-    await createBtn.click();
-    console.log('Creating new tax');
+  // Delete default VAT if present (do not edit it into GST)
+  const vatRow = page.getByRole('row').filter({ hasText: /\bVAT\b/i }).first();
+  if (await vatRow.isVisible({ timeout: 5000 }).catch(() => false)) {
+    const deleteBtn = vatRow.getByRole('button', { name: /Delete/i })
+      .or(vatRow.locator('button[aria-label*="Delete" i]'))
+      .or(vatRow.locator('button').last());
+    await deleteBtn.click({ force: true });
+    const confirmDelete = page.getByRole('dialog').getByRole('button', { name: /Delete|Confirm|Yes/i }).first()
+      .or(page.getByRole('button', { name: /Delete|Confirm|Yes/i }).last());
+    if (await confirmDelete.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await confirmDelete.click();
+    }
+    await vatRow.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+    console.log('Deleted existing VAT tax');
   }
 
-  await page.getByRole('heading', { name: /Edit Tax|Create New Tax|Create.*Tax|New Tax|Tax Information/i })
-    .first()
-    .waitFor({ timeout: 20000 });
+  const gstRow = page.getByRole('row').filter({ hasText: /GST\s*\(\s*18\s*%\s*\)|GST-18/i }).first();
+  if (await gstRow.isVisible({ timeout: 3000 }).catch(() => false)) {
+    console.log('GST (18%) already configured — skipping tax create');
+  } else {
+    await page.getByRole('button', { name: /\+?\s*Create New Tax/i }).first().click();
+    console.log('Creating new tax GST (18%)');
 
-  // Create form uses placeholders as accessible names (not "Tax Name" labels)
-  const taxName = page.getByRole('textbox', { name: /e\.g\., TAX, Service Tax|Tax Name/i })
-    .or(page.getByPlaceholder(/TAX, Service Tax|Tax Name/i))
-    .first();
-  const taxCode = page.getByRole('textbox', { name: /e\.g\., TAX-001|Tax Code/i })
-    .or(page.getByPlaceholder(/TAX-001|Tax Code/i))
-    .first();
-  const taxPct = page.getByRole('spinbutton', { name: /e\.g\., 5\.00|Tax Percentage/i })
-    .or(page.getByPlaceholder(/5\.00|Tax Percentage/i))
-    .or(page.locator('input[type="number"]').first())
-    .first();
+    await page.getByRole('heading', { name: /Create New Tax|Create.*Tax|New Tax|Tax Information/i })
+      .first()
+      .waitFor({ timeout: 20000 });
 
-  await taxName.waitFor({ state: 'visible', timeout: 15000 });
-  await taxName.fill('');
-  await taxName.fill('GST (18%)');
-  await taxCode.fill('');
-  await taxCode.fill('GST-18');
-  await taxPct.fill('');
-  await taxPct.fill('18');
+    const taxName = page.getByRole('textbox', { name: /e\.g\., TAX, Service Tax|Tax Name/i })
+      .or(page.getByPlaceholder(/TAX, Service Tax|Tax Name/i))
+      .first();
+    const taxCode = page.getByRole('textbox', { name: /e\.g\., TAX-001|Tax Code/i })
+      .or(page.getByPlaceholder(/TAX-001|Tax Code/i))
+      .first();
+    const taxPct = page.getByRole('spinbutton', { name: /e\.g\., 5\.00|Tax Percentage/i })
+      .or(page.getByPlaceholder(/5\.00|Tax Percentage/i))
+      .or(page.locator('input[type="number"]').first())
+      .first();
 
-  const saveTaxBtn = page.getByRole('button', {
-    name: isEdit ? /Update Tax/i : /Create Tax/i,
-  }).first();
-  await saveTaxBtn.click();
-  await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 }).catch(() => undefined);
-  await page.getByText(/GST \(18%\)|GST-18|18\.00%/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
-  console.log('Tax settings saved: GST (18%) / GST-18 / 18%');
+    await taxName.waitFor({ state: 'visible', timeout: 15000 });
+    await taxName.fill('');
+    await taxName.fill('GST (18%)');
+    await taxCode.fill('');
+    await taxCode.fill('GST-18');
+    await taxPct.fill('');
+    await taxPct.fill('18');
+
+    await page.getByRole('button', { name: /Create Tax/i }).first().click();
+    await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 }).catch(() => undefined);
+    await page.getByText(/GST \(18%\)|GST-18|18\.00%/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
+    console.log('Tax settings saved: GST (18%) / GST-18 / 18%');
+  }
 
   // Property module → Properties (next step creates property)
   await clickTopNavModule(page, 'Property');
@@ -397,19 +400,41 @@ async function configureDealApprovalWorkflow(page: import('@playwright/test').Pa
   await dismissEndToEndFlowTour(page);
   await dismissNotificationsModal(page);
 
-  await clickTopNavModule(page, 'Admin');
+  try {
+    await clickTopNavModule(page, 'Admin');
+  } catch {
+    await clickTopNavModule(page, 'Settings').catch(() => undefined);
+  }
   await dismissEndToEndFlowTour(page);
   await dismissNotificationsModal(page);
 
-  const approvalNav = page.getByRole('button', { name: /^Approval Workflows$/i })
-    .or(page.getByRole('link', { name: /^Approval Workflows$/i }))
-    .or(page.locator('[data-testid="sidebar-item"]').filter({ hasText: /Approval Workflows/i }))
+  // Wait until Admin sidebar is visible (not still on Property)
+  const adminSidebarReady = page.getByRole('button', { name: /^Employees$/i })
+    .or(page.getByRole('button', { name: /^Integrations$/i }))
+    .or(page.getByRole('button', { name: /Approval Workflow/i }))
+    .or(page.getByText(/^Admin$/i))
     .first();
-  await approvalNav.waitFor({ state: 'attached', timeout: 20000 });
-  await approvalNav.click({ force: true }).catch(async () => {
-    await approvalNav.evaluate((el) => (el as HTMLElement).click());
-  });
-  await page.getByRole('heading', { name: /Approval Workflows/i }).waitFor({ timeout: 20000 });
+  if (!(await adminSidebarReady.isVisible({ timeout: 10000 }).catch(() => false))) {
+    await page.goto('https://test.propexcel.com/admin/approval-workflows', { waitUntil: 'domcontentloaded' });
+  }
+
+  const approvalNav = page.getByRole('button', { name: /Approval Workflow/i })
+    .or(page.getByRole('link', { name: /Approval Workflow/i }))
+    .or(page.locator('[data-testid="sidebar-item"]').filter({ hasText: /Approval Workflow/i }))
+    .or(page.getByText(/Approval Workflow/i))
+    .first();
+
+  if (await approvalNav.isVisible({ timeout: 8000 }).catch(() => false)
+    || await approvalNav.count().then((c) => c > 0).catch(() => false)) {
+    await approvalNav.waitFor({ state: 'attached', timeout: 15000 });
+    await approvalNav.click({ force: true }).catch(async () => {
+      await approvalNav.evaluate((el) => (el as HTMLElement).click());
+    });
+  } else {
+    await page.goto('https://test.propexcel.com/admin/approval-workflows', { waitUntil: 'domcontentloaded' });
+  }
+
+  await page.getByRole('heading', { name: /Approval Workflows/i }).waitFor({ timeout: 30000 });
 
   // Prior run may already have Deal Approve — skip recreate
   const existingDealApprove = page.getByText(/Deal Approve/i).first();
@@ -426,8 +451,15 @@ async function configureDealApprovalWorkflow(page: import('@playwright/test').Pa
     .first()
     .waitFor({ timeout: 30000 });
 
-  // + Create Step → Add New Step
-  await page.getByRole('button', { name: /\+?\s*Create Step/i }).click();
+  // Visual toolbar "+ Create Step" (do not switch to Form)
+  const visualTab = page.getByRole('button', { name: /^Visual$/i });
+  if (await visualTab.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await visualTab.click();
+  }
+  const createStep = page.getByRole('button', { name: /\+?\s*Create Step/i }).first();
+  await createStep.waitFor({ state: 'visible', timeout: 15000 });
+  await createStep.click({ force: true });
+
   const stepDialog = page.getByRole('dialog').filter({ hasText: /Add New Step/i });
   await stepDialog.waitFor({ state: 'visible', timeout: 15000 });
 
@@ -456,12 +488,12 @@ async function configureDealApprovalWorkflow(page: import('@playwright/test').Pa
   const superAdmin = page.getByText('Super Admin', { exact: true }).last();
   await superAdmin.waitFor({ state: 'visible', timeout: 15000 });
   await superAdmin.click();
-  // Close multi-select dropdown so Add Step is clickable
-  await page.keyboard.press('Escape');
+  // Close employee list by focusing Step Name — Escape would close the whole dialog
+  await stepName.click({ force: true }).catch(() => undefined);
   await page.waitForTimeout(300);
 
-  const addStepBtn = page.getByRole('button', { name: /^Add Step$/i }).last();
-  await addStepBtn.scrollIntoViewIfNeeded();
+  const addStepBtn = stepDialog.getByRole('button', { name: /^Add Step$/i }).first();
+  await addStepBtn.waitFor({ state: 'visible', timeout: 10000 });
   await addStepBtn.click({ force: true });
   await stepDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
   await page.getByText(/Add New Step/i).first().waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
@@ -486,7 +518,8 @@ async function configureDealApprovalWorkflow(page: import('@playwright/test').Pa
   await workflowName.fill('');
   await workflowName.fill('Deal Approve');
 
-  const enabled = page.getByRole('radio', { name: /Workflow Enabled/i })
+  const enabled = page.getByRole('checkbox', { name: /Workflow Enabled/i })
+    .or(page.getByRole('radio', { name: /Workflow Enabled/i }))
     .or(page.getByText(/Workflow Enabled/i));
   await enabled.first().click();
 
