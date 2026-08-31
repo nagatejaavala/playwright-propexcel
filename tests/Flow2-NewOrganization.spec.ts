@@ -2,6 +2,7 @@ import { test, expect, Page, Locator, BrowserContext } from '@playwright/test';
 import { loadSharedTenantDataNewOrg } from '../utils/SharedTenantData';
 import { nextSharedCategory, SHARED_CATEGORIES } from '../utils/SharedCategory';
 import { loadSharedOrgData } from '../utils/SharedOrgData';
+import { FlowPerfTracker, saveFlowPerformance } from '../utils/FlowPerformance';
 
 function randomSuffix() {
   return Date.now().toString().slice(-6);
@@ -109,6 +110,7 @@ async function pickFromOpenedList(
   page: Page,
   label: string,
   preferred?: string | RegExp,
+  fallbackPreferred?: string | RegExp,
 ): Promise<string> {
   const options = dropdownOptionLocator(page);
   await options.first().waitFor({ state: 'visible', timeout: 10000 });
@@ -122,14 +124,21 @@ async function pickFromOpenedList(
     allTexts.push(((await options.nth(i).textContent()) || '').trim());
   }
 
-  if (preferred) {
-    const matcher = preferred instanceof RegExp ? preferred : new RegExp(`^${escapeRegExp(preferred)}$`, 'i');
-    for (let i = 0; i < count; i++) {
-      const text = allTexts[i];
-      if (matcher.test(text)) {
-        console.log(`${label} -> ${text}`);
-        await options.nth(i).click();
-        return text;
+  const matchers: RegExp[] = [];
+  for (const pref of [preferred, fallbackPreferred]) {
+    if (!pref) continue;
+    matchers.push(pref instanceof RegExp ? pref : new RegExp(`^${escapeRegExp(pref)}$`, 'i'));
+  }
+
+  if (matchers.length > 0) {
+    for (const matcher of matchers) {
+      for (let i = 0; i < count; i++) {
+        const text = allTexts[i];
+        if (matcher.test(text)) {
+          console.log(`${label} -> ${text}`);
+          await options.nth(i).click();
+          return text;
+        }
       }
     }
     throw new Error(
@@ -177,16 +186,87 @@ async function selectFormDropdown(
   return pickFromOpenedList(page, fieldName, preferred);
 }
 
+async function resolveTaskCombobox(
+  taskDialog: Locator,
+  comboHint: RegExp,
+  fieldName: string,
+  index: number,
+): Promise<Locator> {
+  const labels = [fieldName, fieldName.replace(/^Task /, '')];
+  for (const label of labels) {
+    const byRole = taskDialog.getByRole('combobox', { name: new RegExp(label, 'i') });
+    if (await byRole.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+      return byRole.first();
+    }
+  }
+
+  const filtered = taskDialog.getByRole('combobox').filter({ hasText: comboHint });
+  if (await filtered.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+    return filtered.first();
+  }
+
+  const all = taskDialog.getByRole('combobox');
+  const count = await all.count();
+  for (let i = 0; i < count; i++) {
+    const combo = all.nth(i);
+    const text = ((await combo.textContent()) || '').trim();
+    if (comboHint.test(text)) {
+      return combo;
+    }
+  }
+
+  const byLabel = await comboboxForLabel(taskDialog, fieldName.replace(/^Task /, ''));
+  if (await byLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+    return byLabel;
+  }
+
+  if (index < count) {
+    return all.nth(index);
+  }
+  if (count > 0) {
+    return all.last();
+  }
+  throw new Error(`Combobox not found for ${fieldName}`);
+}
+
 async function selectTaskDialogDropdown(
   page: Page,
   taskDialog: Locator,
   comboHint: RegExp,
   fieldName: string,
   preferred?: string | RegExp,
+  searchText?: string,
+  comboIndex = 0,
+  fallbackPreferred?: string | RegExp,
 ): Promise<string> {
-  const combo = taskDialog.getByRole('combobox').filter({ hasText: comboHint }).first();
-  await openCombobox(page, combo);
-  return pickFromOpenedList(page, fieldName, preferred);
+  const deadline = Date.now() + 60_000;
+  let lastError: Error | undefined;
+
+  while (Date.now() < deadline) {
+    const combo = await resolveTaskCombobox(taskDialog, comboHint, fieldName, comboIndex);
+    await openCombobox(page, combo);
+    if (searchText) {
+      const search = page.getByRole('textbox', { name: /Search/i }).last();
+      if (await search.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await search.fill('');
+        await search.fill(searchText);
+        await page.waitForTimeout(800);
+      }
+    }
+    try {
+      return await pickFromOpenedList(page, fieldName, preferred, fallbackPreferred);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (fallbackPreferred && lastError.message.includes('not found')) {
+        throw lastError;
+      }
+      console.log(`${fieldName}: dropdown retry — ${lastError.message}`);
+      await page.keyboard.press('Escape').catch(() => undefined);
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  throw lastError ?? new Error(`${fieldName}: could not select from dropdown`);
 }
 
 async function selectProperty(page: Page, propertyName: string): Promise<string> {
@@ -414,14 +494,16 @@ async function fillInvoiceLineItemWithRentalIncome(
     await lineItemDialog.getByText(/1000 - Cash \(Asset/i).click();
   }
 
-  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
-  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
-  await accountSearch.fill('4000');
+  // Combobox search/options are portaled outside the dialog
+  const accountSearch = page.getByRole('textbox', { name: /Search/i })
+    .or(page.getByPlaceholder(/Search/i))
+    .last();
+  if (await accountSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await accountSearch.fill('4000');
+  }
 
-  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000/i }).first()
-    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income/i))
-    .or(page.getByRole('option', { name: /4000/i }).first())
-    .or(page.getByText(/4000\s*-\s*Rental Income/i));
+  const rentalIncome = page.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
+    .or(page.getByRole('option', { name: /4000/i }));
 
   await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
   await rentalIncome.first().click();
@@ -543,7 +625,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   const vendor = {
     name: `Vendor ${suffix}`,
     contactName: `Contact ${suffix}`,
-    email: `vendor${suffix}@yopmail.com`,
+    email: `propexceltest+vendor${suffix}@gmail.com`,
     mobile: `9${Math.floor(100000000 + Math.random() * 900000000)}`,
     gst: randomGst(),
     city: 'Hyderabad',
@@ -565,7 +647,15 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   test.setTimeout(720_000);
   page.setDefaultTimeout(30_000);
+  const perf = new FlowPerfTracker();
+  let selectedCategory = '';
+  let selectedPriority = '';
+  let vendorCategory = '';
+  let refNo = '';
+  let billItemName = '';
+  let invoiceAmount = '';
 
+  await perf.step('Tenant login + create request', async () => {
   // 1) Login as tenant from Flow 1 New Org (tenant-new-org.json)
   await fillLoginForm(page, tenant.orgId || admin.orgId, tenant.email, tenant.password);
   await page.waitForURL(
@@ -597,8 +687,8 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   await fillRequestTitle();
 
-  const selectedCategory = await selectFormDropdown(page, 'Category', 'Category', sharedCategory);
-  const selectedPriority = await selectFormDropdown(page, 'Priority', 'Priority');
+  selectedCategory = await selectFormDropdown(page, 'Category', 'Category', sharedCategory);
+  selectedPriority = await selectFormDropdown(page, 'Priority', 'Priority');
 
   const requestDescription =
     `Automated ${selectedCategory} request for property ${selectedProperty}. ` +
@@ -633,6 +723,9 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
     priority: selectedPriority,
   });
 
+  });
+
+  await perf.step('Admin vendor create', async () => {
   // 3) Logout tenant
   await logoutTenant(page, tenant.fullName);
 
@@ -651,7 +744,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   // Vendor Details
   await page.getByPlaceholder(/ABC Supplies/i).fill(vendor.name);
-  const vendorCategory = await selectVendorCategory(page, sharedCategory);
+  vendorCategory = await selectVendorCategory(page, sharedCategory);
   await page.getByPlaceholder(/Registration number/i).fill(vendor.gst);
 
   // Contact Information
@@ -676,6 +769,9 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
     matchedRequestCategory: selectedCategory === vendorCategory,
   });
 
+  });
+
+  await perf.step('Operations request + task workflow', async () => {
   // 8) Operations → Requests
   await page.goto('https://test.propexcel.com/operations', { waitUntil: 'domcontentloaded' });
   await page.getByRole('heading', { name: /Operations Dashboard/i }).waitFor({ timeout: 15000 });
@@ -691,23 +787,28 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   // 10) Start Progress
   await page.getByRole('button', { name: /Start Progress/i }).click();
+  await page.getByRole('button', { name: /Add task/i }).waitFor({ state: 'visible', timeout: 30000 });
 
   // 11) Add task
   await page.getByRole('button', { name: /Add task/i }).click();
 
   const taskDialog = page.getByRole('dialog', { name: /Add Task/i });
   await taskDialog.getByRole('heading', { name: /Add Task/i }).waitFor({ timeout: 15000 });
+  await taskDialog.getByRole('combobox').first().waitFor({ state: 'visible', timeout: 30000 });
 
   await taskDialog.getByRole('textbox', { name: /Title/i }).fill(taskTitle);
 
-  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status/i, 'Task Status', 'Open');
-  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority');
+  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status|Open/i, 'Task Status', 'Open', undefined, 0);
+  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority', undefined, undefined, 1);
   const assignedVendor = await selectTaskDialogDropdown(
     page,
     taskDialog,
     /Not Assigned|Select vendor/i,
     'Assign to Vendor',
     new RegExp(escapeRegExp(vendor.name), 'i'),
+    vendor.name,
+    2,
+    /Super Admin/i,
   );
 
   // 12) Save Task
@@ -773,6 +874,9 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   // 21) Logout Super Admin
   await logoutSuperAdmin(page, admin.orgName);
 
+  });
+
+  await perf.step('Tenant request approval', async () => {
   // 22) Login as tenant again
   await fillLoginForm(page, tenant.orgId || admin.orgId, tenant.email, tenant.password);
   await page.waitForURL(
@@ -825,6 +929,9 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   // 27) Logout tenant
   await logoutTenant(page, tenant.fullName);
 
+  });
+
+  await perf.step('Bill create + payment', async () => {
   // 28) Login Super Admin (from org.json)
   await fillLoginForm(page, admin.orgId, admin.email, admin.password);
   await dismissEndToEndFlowTour(page);
@@ -844,7 +951,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   await page.getByRole('heading', { name: /New Bill/i }).waitFor({ timeout: 15000 });
 
   // 31) Reference Number
-  const refNo = `REF-${suffix}`;
+  refNo = `REF-${suffix}`;
   await page.getByPlaceholder(/Enter reference number/i).fill(refNo);
 
   // 32) Vendor (combo) — vendor created in this run
@@ -884,7 +991,7 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
 
   // 36–41) Add Item → fill line item → Save
   await page.getByRole('button', { name: /Add Item/i }).click();
-  const billItemName = itemNameForCategory(sharedCategory);
+  billItemName = itemNameForCategory(sharedCategory);
   const quantity = String(1 + Math.floor(Math.random() * 5));
   const unitPrice = String(100 + Math.floor(Math.random() * 900));
   await fillBillLineItem(page, billItemName, quantity, unitPrice, vendorCategory);
@@ -986,8 +1093,11 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   ).toBeVisible({ timeout: 30000 });
   console.log('Bill paid:', refNo);
 
-  const invoiceAmount = String(Number(quantity) * Number(unitPrice));
+  invoiceAmount = String(Number(quantity) * Number(unitPrice));
 
+  });
+
+  await perf.step('Admin invoice create', async () => {
   // 48) Accounts → Invoices (left sidebar)
   const invoicesNav = page.getByRole('navigation').getByRole('button', { name: /^Invoices$/i });
   if (await invoicesNav.isVisible({ timeout: 5000 }).catch(() => false)) {
@@ -1064,6 +1174,9 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   // 56) Logout Super Admin
   await logoutSuperAdmin(page, admin.orgName);
 
+  });
+
+  await perf.step('Tenant Razorpay payment', async () => {
   // 57) Login as tenant
   await fillLoginForm(page, tenant.orgId || admin.orgId, tenant.email, tenant.password);
   await page.waitForURL(
@@ -1113,4 +1226,15 @@ test('Flow 2 with New Organization — tenant request, vendor, bill, and invoice
   await page.getByRole('button', { name: /Pay with Razorpay/i }).click();
   await payViaRazorpayNetbanking(page, context);
   console.log('Tenant paid Flow 2 invoice via Razorpay');
+  });
+
+  const perfReport = perf.buildReport({
+    flow: 'Flow2-NewOrganization',
+    orgId: admin.orgId,
+    orgName: admin.orgName,
+    tenantEmail: tenant.email,
+    tenantName: tenant.fullName,
+  });
+  perf.logSummary(perfReport);
+  saveFlowPerformance('flow2-new-org-performance', perfReport);
 });

@@ -14,24 +14,20 @@
  */
 import { test, expect } from "@playwright/test";
 import {
-  captureTenantPasswordFromDialog,
+  confirmCreateTenantUserAndCapturePassword,
   createTenantPasswordCapture,
-  getTenantCredentialsFromYopmail,
   resolveTenantCredentials,
-  startYopmailCredentialPolling,
+  startGmailCredentialPolling,
+  getTenantCredentialsFromImap,
 } from "../utils/TenantCredentials";
 import { saveSharedTenantDataNewOrg } from "../utils/SharedTenantData";
 import { loadSharedOrgData } from "../utils/SharedOrgData";
-
-function generateTestData() {
-  const suffix = Date.now().toString().slice(-6);
-  return {
-    fullName: `lead${suffix}`,
-    email: `lead${suffix}@yopmail.com`,
-    mobile: `8${Math.floor(100000000 + Math.random() * 900000000)}`,
-    propertyName: `villa${suffix}`,
-  };
-}
+import { fillInvoiceLineItemWithRentalIncome } from "../utils/InvoiceLineItem";
+import {
+  commitSequentialTenantIdentity,
+  fillIndiaPhoneInLeadForm,
+  peekNextSequentialTenantIdentity,
+} from "../utils/SharedTenantContactData";
 
 function formatMoveInDate(date: Date = new Date()) {
   const day = String(date.getDate()).padStart(2, '0');
@@ -266,10 +262,27 @@ async function dismissNotificationsModal(page: import('@playwright/test').Page) 
 /** Click a top-nav module button (Property / Admin / CRM / …) via aria-label — often not "visible" to Playwright. */
 async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabel: string) {
   const btn = page.locator(`button[aria-label="${ariaLabel}"]`).first();
-  await btn.waitFor({ state: 'attached', timeout: 15000 });
-  await btn.evaluate((el) => (el as HTMLElement).click());
+  if (await btn.count()) {
+    try {
+      await btn.waitFor({ state: 'attached', timeout: 8000 });
+      await btn.evaluate((el) => (el as HTMLElement).click());
+      return;
+    } catch {
+      // Fall through to URL navigation
+    }
+  }
+  const fallbacks: Record<string, string> = {
+    Accounts: 'https://test.propexcel.com/accounts',
+    CRM: 'https://test.propexcel.com/crm/contacts',
+    Property: 'https://test.propexcel.com/property/properties',
+    Admin: 'https://test.propexcel.com/admin',
+    Settings: 'https://test.propexcel.com/admin/settings',
+  };
+  const url = fallbacks[ariaLabel];
+  if (!url) throw new Error(`Top nav module not found: ${ariaLabel}`);
+  console.log(`Top nav "${ariaLabel}" not found — navigating to ${url}`);
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
 }
-
 
 /** CRM → Leads page via sidebar (or direct URL). */
 async function goToCrmLeads(page: import('@playwright/test').Page) {
@@ -601,59 +614,18 @@ async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: 
   await page.waitForURL(/\/login/, { timeout: 15000 });
 }
 
-async function fillInvoiceLineItemWithRentalIncome(
-  page: import('@playwright/test').Page,
-  amount: string,
-) {
-  const lineItemDialog = page.getByRole('dialog').filter({ hasText: /Line Item/i }).last();
-  await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 15000 });
-
-  const itemField = lineItemDialog.getByLabel(/^Item$/i);
-  if (await itemField.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await itemField.fill('rent');
-  }
-
-  // Chart of Account — open combobox (default is often 1000 - Cash)
-  const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i);
-  const chartCombo = lineItemDialog.getByRole('combobox').filter({
-    hasText: /1000 - Cash|4000 - Rental Income|Chart of Account/i,
-  }).first();
-
-  if (await chartCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await chartCombo.click();
-  } else if (await chartLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
-  } else {
-    await lineItemDialog.getByText(/1000 - Cash \(Asset/i).click();
-  }
-
-  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
-  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
-  await accountSearch.fill('4000');
-
-  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
-    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i))
-    .or(page.getByRole('option', { name: /4000\s*-\s*Rental Income/i }))
-    .or(page.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i));
-
-  await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
-  await rentalIncome.first().click();
-  console.log('Chart of Account -> 4000 - Rental Income');
-
-  const amountField = lineItemDialog.getByLabel(/Amount.*Incl.*Tax/i)
-    .or(lineItemDialog.getByPlaceholder('0.00'))
-    .or(lineItemDialog.locator('div.grid input').first());
-  await amountField.first().fill(amount);
-
-  await lineItemDialog.getByRole('button', { name: /^Save$/i }).click();
-  await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
-}
-
 test('Direct Lead — auto contact through rent payment (new org)', async ({ page, context }) => {
-  const data = generateTestData();
+  const tenant = peekNextSequentialTenantIdentity();
+  const data = {
+    fullName: tenant.fullName,
+    email: tenant.email,
+    mobile: tenant.mobile,
+    propertyName: `villa${tenant.number}`,
+    tenantNumber: tenant.number,
+  };
   const moveInDate = formatMoveInDate();
   const passwordCapture = createTenantPasswordCapture(page);
-  let yopmailCredentialsPromise: ReturnType<typeof startYopmailCredentialPolling> | undefined;
+  let gmailCredentialsPromise: ReturnType<typeof startGmailCredentialPolling> | undefined;
   let tenantPassword: string | undefined;
   const admin = loadSharedOrgData();
   console.log('Run data (new lead / auto contact):', data, 'Move-in date:', moveInDate);
@@ -721,10 +693,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
             .first();
           await emailField.fill(data.email);
 
-          const mobileField = leadForm.getByRole('textbox', { name: '+1234567890' })
-            .or(leadForm.getByPlaceholder('+1234567890'))
-            .first();
-          await mobileField.fill(data.mobile);
+          await fillIndiaPhoneInLeadForm(leadForm, data.mobile);
 
           const nationality = leadForm.getByRole('combobox', { name: /e\.g\., UAE|nationality/i }).first();
           if (await nationality.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -733,7 +702,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
             if (await natSearch.isVisible({ timeout: 2000 }).catch(() => false)) {
               await natSearch.fill('indian');
             }
-            const indian = page.getByRole('option', { name: 'Indian' });
+            const indian = page.getByRole('option', { name: 'Indian', exact: true });
             if (await indian.isVisible({ timeout: 3000 }).catch(() => false)) {
               await indian.click();
             } else {
@@ -774,7 +743,10 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
           await page.getByRole('button', { name: 'Convert to Deal' }).click();
           const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
           await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
-          await convertDialog.getByRole('combobox', { name: 'Select payment type...' }).click();
+          await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
+          const paymentCombo = convertDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
+            .or(convertDialog.getByText(/Select payment type/i));
+          await paymentCombo.first().click();
           await page.getByRole('option').first().click();
           await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
           await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
@@ -872,18 +844,12 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
 
           await page.getByRole('tab', { name: 'Action Buttons' }).click();
           await page.getByRole('button', { name: /Create Tenant User/i }).click();
-          const tenantDialog = page.getByRole('dialog');
-          if (await tenantDialog.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await tenantDialog.getByRole('button', { name: /Create|Confirm|Yes|Submit/i }).click();
-            const dialogPassword = await captureTenantPasswordFromDialog(page);
-            if (dialogPassword) {
-              passwordCapture.setPassword(dialogPassword);
-              console.log('Tenant password captured from dialog');
-            }
-            await tenantDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
+          const dialogPassword = await confirmCreateTenantUserAndCapturePassword(page, passwordCapture);
+          if (dialogPassword) {
+            console.log('Tenant password captured for tenant user');
           }
           if (!passwordCapture.getPassword()) {
-            yopmailCredentialsPromise = startYopmailCredentialPolling(context, data.email, page);
+            gmailCredentialsPromise = startGmailCredentialPolling(context, data.email, page);
           }
       }
       {
@@ -936,7 +902,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
 
           const tenantCredentials = await resolveTenantCredentials({
             capturedPassword: passwordCapture.getPassword(),
-            yopmailPromise: yopmailCredentialsPromise,
+            gmailPromise: gmailCredentialsPromise,
             page,
             context,
             email: data.email,
@@ -963,8 +929,8 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
             const loginResult = await Promise.race([leftLogin, sawInvalid]);
 
             if (loginResult === 'invalid') {
-              console.log('Login failed — retrying with fresh YOPmail fetch');
-              const retryCredentials = await getTenantCredentialsFromYopmail(page, data.email);
+              console.log('Login failed — retrying with fresh IMAP fetch');
+              const retryCredentials = await getTenantCredentialsFromImap(data.email, 120_000);
               tenantPassword = retryCredentials.password;
               const passwordField = page.getByRole('textbox', { name: /^Password$/i }).or(page.locator('#password'));
               await passwordField.first().fill('');
@@ -1078,7 +1044,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
           if (!tenantPassword) {
             const refreshed = await resolveTenantCredentials({
               capturedPassword: passwordCapture.getPassword(),
-              yopmailPromise: yopmailCredentialsPromise,
+              gmailPromise: gmailCredentialsPromise,
               page,
               context,
               email: data.email,
@@ -1158,6 +1124,8 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
     orgId: admin.orgId,
     moveInDate,
   });
+
+  commitSequentialTenantIdentity(data.tenantNumber);
 
   passwordCapture.dispose();
 });

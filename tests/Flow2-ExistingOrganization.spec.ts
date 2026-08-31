@@ -1,5 +1,6 @@
 import { test, expect, Page, Locator, BrowserContext } from '@playwright/test';
 import { loadSharedTenantData } from '../utils/SharedTenantData';
+import { EXISTING_ORG_ADMIN } from '../utils/SharedOrgData';
 import { nextSharedCategory, SHARED_CATEGORIES } from '../utils/SharedCategory';
 
 function randomSuffix() {
@@ -80,6 +81,7 @@ async function pickFromOpenedList(
   page: Page,
   label: string,
   preferred?: string | RegExp,
+  fallbackPreferred?: string | RegExp,
 ): Promise<string> {
   const options = dropdownOptionLocator(page);
   await options.first().waitFor({ state: 'visible', timeout: 10000 });
@@ -93,14 +95,21 @@ async function pickFromOpenedList(
     allTexts.push(((await options.nth(i).textContent()) || '').trim());
   }
 
-  if (preferred) {
-    const matcher = preferred instanceof RegExp ? preferred : new RegExp(`^${escapeRegExp(preferred)}$`, 'i');
-    for (let i = 0; i < count; i++) {
-      const text = allTexts[i];
-      if (matcher.test(text)) {
-        console.log(`${label} -> ${text}`);
-        await options.nth(i).click();
-        return text;
+  const matchers: RegExp[] = [];
+  for (const pref of [preferred, fallbackPreferred]) {
+    if (!pref) continue;
+    matchers.push(pref instanceof RegExp ? pref : new RegExp(`^${escapeRegExp(pref)}$`, 'i'));
+  }
+
+  if (matchers.length > 0) {
+    for (const matcher of matchers) {
+      for (let i = 0; i < count; i++) {
+        const text = allTexts[i];
+        if (matcher.test(text)) {
+          console.log(`${label} -> ${text}`);
+          await options.nth(i).click();
+          return text;
+        }
       }
     }
     throw new Error(
@@ -148,16 +157,87 @@ async function selectFormDropdown(
   return pickFromOpenedList(page, fieldName, preferred);
 }
 
+async function resolveTaskCombobox(
+  taskDialog: Locator,
+  comboHint: RegExp,
+  fieldName: string,
+  index: number,
+): Promise<Locator> {
+  const labels = [fieldName, fieldName.replace(/^Task /, '')];
+  for (const label of labels) {
+    const byRole = taskDialog.getByRole('combobox', { name: new RegExp(label, 'i') });
+    if (await byRole.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+      return byRole.first();
+    }
+  }
+
+  const filtered = taskDialog.getByRole('combobox').filter({ hasText: comboHint });
+  if (await filtered.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+    return filtered.first();
+  }
+
+  const all = taskDialog.getByRole('combobox');
+  const count = await all.count();
+  for (let i = 0; i < count; i++) {
+    const combo = all.nth(i);
+    const text = ((await combo.textContent()) || '').trim();
+    if (comboHint.test(text)) {
+      return combo;
+    }
+  }
+
+  const byLabel = await comboboxForLabel(taskDialog, fieldName.replace(/^Task /, ''));
+  if (await byLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
+    return byLabel;
+  }
+
+  if (index < count) {
+    return all.nth(index);
+  }
+  if (count > 0) {
+    return all.last();
+  }
+  throw new Error(`Combobox not found for ${fieldName}`);
+}
+
 async function selectTaskDialogDropdown(
   page: Page,
   taskDialog: Locator,
   comboHint: RegExp,
   fieldName: string,
   preferred?: string | RegExp,
+  searchText?: string,
+  comboIndex = 0,
+  fallbackPreferred?: string | RegExp,
 ): Promise<string> {
-  const combo = taskDialog.getByRole('combobox').filter({ hasText: comboHint }).first();
-  await openCombobox(page, combo);
-  return pickFromOpenedList(page, fieldName, preferred);
+  const deadline = Date.now() + 60_000;
+  let lastError: Error | undefined;
+
+  while (Date.now() < deadline) {
+    const combo = await resolveTaskCombobox(taskDialog, comboHint, fieldName, comboIndex);
+    await openCombobox(page, combo);
+    if (searchText) {
+      const search = page.getByRole('textbox', { name: /Search/i }).last();
+      if (await search.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await search.fill('');
+        await search.fill(searchText);
+        await page.waitForTimeout(800);
+      }
+    }
+    try {
+      return await pickFromOpenedList(page, fieldName, preferred, fallbackPreferred);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (fallbackPreferred && lastError.message.includes('not found')) {
+        throw lastError;
+      }
+      console.log(`${fieldName}: dropdown retry — ${lastError.message}`);
+      await page.keyboard.press('Escape').catch(() => undefined);
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  throw lastError ?? new Error(`${fieldName}: could not select from dropdown`);
 }
 
 async function selectProperty(page: Page, propertyName: string): Promise<string> {
@@ -381,14 +461,16 @@ async function fillInvoiceLineItemWithRentalIncome(
     await lineItemDialog.getByText(/1000 - Cash \(Asset/i).click();
   }
 
-  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
-  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
-  await accountSearch.fill('4000');
+  // Combobox search/options are portaled outside the dialog
+  const accountSearch = page.getByRole('textbox', { name: /Search/i })
+    .or(page.getByPlaceholder(/Search/i))
+    .last();
+  if (await accountSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await accountSearch.fill('4000');
+  }
 
-  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000/i }).first()
-    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income/i))
-    .or(page.getByRole('option', { name: /4000/i }).first())
-    .or(page.getByText(/4000\s*-\s*Rental Income/i));
+  const rentalIncome = page.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
+    .or(page.getByRole('option', { name: /4000/i }));
 
   await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
   await rentalIncome.first().click();
@@ -508,7 +590,7 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
   const vendor = {
     name: `Vendor ${suffix}`,
     contactName: `Contact ${suffix}`,
-    email: `vendor${suffix}@yopmail.com`,
+    email: `propexceltest+vendor${suffix}@gmail.com`,
     mobile: `9${Math.floor(100000000 + Math.random() * 900000000)}`,
     gst: randomGst(),
     city: 'Hyderabad',
@@ -601,7 +683,7 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
   await logoutTenant(page, tenant.fullName);
 
   // 4) Login Super Admin
-  await fillLoginForm(page, tenant.orgId || 'test240', 'test240@yopmail.com', 'Test2026$');
+  await fillLoginForm(page, tenant.orgId || EXISTING_ORG_ADMIN.orgId, EXISTING_ORG_ADMIN.email, EXISTING_ORG_ADMIN.password);
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
 
   // 5) Accounts → Vendors
@@ -654,23 +736,28 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
 
   // 10) Start Progress
   await page.getByRole('button', { name: /Start Progress/i }).click();
+  await page.getByRole('button', { name: /Add task/i }).waitFor({ state: 'visible', timeout: 30000 });
 
   // 11) Add task
   await page.getByRole('button', { name: /Add task/i }).click();
 
   const taskDialog = page.getByRole('dialog', { name: /Add Task/i });
   await taskDialog.getByRole('heading', { name: /Add Task/i }).waitFor({ timeout: 15000 });
+  await taskDialog.getByRole('combobox').first().waitFor({ state: 'visible', timeout: 30000 });
 
   await taskDialog.getByRole('textbox', { name: /Title/i }).fill(taskTitle);
 
-  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status/i, 'Task Status', 'Open');
-  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority');
+  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status|Open/i, 'Task Status', 'Open', undefined, 0);
+  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority', undefined, undefined, 1);
   const assignedVendor = await selectTaskDialogDropdown(
     page,
     taskDialog,
     /Not Assigned|Select vendor/i,
     'Assign to Vendor',
     new RegExp(escapeRegExp(vendor.name), 'i'),
+    vendor.name,
+    2,
+    /Super Admin/i,
   );
 
   // 12) Save Task
@@ -789,7 +876,7 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
   await logoutTenant(page, tenant.fullName);
 
   // 28) Login Super Admin
-  await fillLoginForm(page, tenant.orgId || 'test240', 'test240@yopmail.com', 'Test2026$');
+  await fillLoginForm(page, tenant.orgId || EXISTING_ORG_ADMIN.orgId, EXISTING_ORG_ADMIN.email, EXISTING_ORG_ADMIN.password);
   await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
 
   // 29) Accounts → Bills (left sidebar)

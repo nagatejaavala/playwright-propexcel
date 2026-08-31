@@ -1,22 +1,20 @@
 import { test, expect } from "@playwright/test";
 import {
-  captureTenantPasswordFromDialog,
+  confirmCreateTenantUserAndCapturePassword,
   createTenantPasswordCapture,
-  getTenantCredentialsFromYopmail,
   resolveTenantCredentials,
-  startYopmailCredentialPolling,
+  startGmailCredentialPolling,
+  getTenantCredentialsFromImap,
 } from "../utils/TenantCredentials";
 import { saveSharedTenantData } from "../utils/SharedTenantData";
-
-function generateTestData() {
-  const suffix = Date.now().toString().slice(-6);
-  return {
-    fullName: `user${suffix}`,
-    email: `user${suffix}@yopmail.com`,
-    mobile: `9${Math.floor(100000000 + Math.random() * 900000000)}`,
-    propertyName: `villa${suffix}`,
-  };
-}
+import { fillInvoiceLineItemWithRentalIncome } from "../utils/InvoiceLineItem";
+import {
+  commitSequentialTenantIdentity,
+  peekNextSequentialTenantIdentity,
+  fillIndiaPhoneInContactDialog,
+  fillIndiaPhoneInLeadForm,
+} from "../utils/SharedTenantContactData";
+import { EXISTING_ORG_ADMIN } from "../utils/SharedOrgData";
 
 function formatMoveInDate(date: Date = new Date()) {
   const day = String(date.getDate()).padStart(2, '0');
@@ -178,59 +176,38 @@ async function fillLoginFields(
   await passwordField.first().fill(password);
 }
 
-async function fillInvoiceLineItemWithRentalIncome(
-  page: import('@playwright/test').Page,
-  amount: string,
-) {
-  const lineItemDialog = page.getByRole('dialog').filter({ hasText: /Line Item/i }).last();
-  await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 15000 });
-
-  const itemField = lineItemDialog.getByLabel(/^Item$/i);
-  if (await itemField.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await itemField.fill('rent');
+async function openExistingLead(page: import('@playwright/test').Page, fullName: string) {
+  const viewLead = page.getByRole('link', { name: /View Lead|Open Lead/i })
+    .or(page.getByRole('button', { name: /View Lead/i }));
+  if (await viewLead.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    await viewLead.first().click();
+    await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 30000 });
+    return;
   }
 
-  // Chart of Account — open combobox (default is often 1000 - Cash)
-  const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i);
-  const chartCombo = lineItemDialog.getByRole('combobox').filter({
-    hasText: /1000 - Cash|4000 - Rental Income|Chart of Account/i,
-  }).first();
-
-  if (await chartCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await chartCombo.click();
-  } else if (await chartLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
-  } else {
-    await lineItemDialog.getByText(/1000 - Cash \(Asset/i).click();
+  await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: /Leads/i }).waitFor({ timeout: 15000 });
+  const search = page.getByRole('combobox', { name: /Search/i }).or(page.getByPlaceholder('Search...')).first();
+  if (await search.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await search.fill(fullName);
+    await page.waitForTimeout(1000);
   }
-
-  const accountSearch = lineItemDialog.getByRole('textbox', { name: /Search/i }).last();
-  await accountSearch.waitFor({ state: 'visible', timeout: 10000 });
-  await accountSearch.fill('4000');
-
-  const rentalIncome = lineItemDialog.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
-    .or(lineItemDialog.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i))
-    .or(page.getByRole('option', { name: /4000\s*-\s*Rental Income/i }))
-    .or(page.getByText(/4000\s*-\s*Rental Income.*Operating Revenue/i));
-
-  await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
-  await rentalIncome.first().click();
-  console.log('Chart of Account -> 4000 - Rental Income');
-
-  const amountField = lineItemDialog.getByLabel(/Amount.*Incl.*Tax/i)
-    .or(lineItemDialog.getByPlaceholder('0.00'))
-    .or(lineItemDialog.locator('div.grid input').first());
-  await amountField.first().fill(amount);
-
-  await lineItemDialog.getByRole('button', { name: /^Save$/i }).click();
-  await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  await page.locator('h3, h4').filter({ hasText: new RegExp(`^${fullName}$`, 'i') }).first().click();
+  await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 30000 });
 }
 
 test('Propexcel end-to-end flow', async ({ page, context }) => {
-  const data = generateTestData();
+  const tenant = peekNextSequentialTenantIdentity();
+  const data = {
+    fullName: tenant.fullName,
+    email: tenant.email,
+    mobile: tenant.mobile,
+    propertyName: `villa${tenant.number}`,
+    tenantNumber: tenant.number,
+  };
   const moveInDate = formatMoveInDate();
   const passwordCapture = createTenantPasswordCapture(page);
-  let yopmailCredentialsPromise: ReturnType<typeof startYopmailCredentialPolling> | undefined;
+  let gmailCredentialsPromise: ReturnType<typeof startGmailCredentialPolling> | undefined;
   let tenantPassword: string | undefined;
   console.log('Run data:', data, 'Move-in date:', moveInDate);
 
@@ -241,7 +218,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
           await page.getByRole('heading', { name: /Welcome Back/i }).waitFor({ timeout: 30000 });
-          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await fillLoginFields(page, EXISTING_ORG_ADMIN.orgId, EXISTING_ORG_ADMIN.email, EXISTING_ORG_ADMIN.password);
           await page.getByRole('button', { name: 'Sign In' }).click();
           await page.getByRole('heading', { name: 'Properties' }).waitFor({ timeout: 60000 });
       }
@@ -283,7 +260,6 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
          // await page.locator("div.lg\\:grid-cols-4 input").fill('3000');
           await page.locator("div.lg\\:grid-cols-4 input[type='number']").fill('3000');
 
-
       }
       {
 
@@ -307,42 +283,90 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
           await page.getByRole('heading', { name: 'Contacts Management' }).waitFor();
           await page.getByRole('button', { name: 'Create Contact' }).click();
-          await page.getByRole('dialog', { name: 'Create New Contact' }).waitFor();
-          await page.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
-          await page.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
-          await page.getByRole('textbox', { name: 'Enter mobile number' }).fill(data.mobile);
-          await page.getByRole('combobox', { name: 'Enter nationality' }).click();
-          await page.getByRole('textbox', { name: 'Search...' }).fill('indian');
-          await page.getByRole('option', { name: 'Indian' }).click();
           const createDialog = page.getByRole('dialog', { name: 'Create New Contact' });
-          await page.getByRole('button', { name: 'Create Contact' }).click();
-          await createDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(async () => {
-            if (await createDialog.isVisible()) {
-              await createDialog.getByRole('button', { name: 'Close' }).click();
+          await createDialog.waitFor();
+          await createDialog.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
+          await createDialog.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
+          await fillIndiaPhoneInContactDialog(createDialog, data.mobile);
+          await createDialog.getByRole('combobox', { name: 'Enter nationality' }).click();
+          await createDialog.getByRole('textbox', { name: 'Search...' }).fill('indian');
+          await page.getByRole('option', { name: 'Indian', exact: true }).click();
+          await createDialog.getByRole('button', { name: 'Create Contact' }).click();
+          const dialogClosed = await createDialog.waitFor({ state: 'hidden', timeout: 15000 }).then(() => true).catch(() => false);
+          if (!dialogClosed) {
+            const duplicateHint = page.getByText(/already exists|duplicate|email.*taken/i);
+            if (await duplicateHint.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+              console.log('Contact already exists — closing dialog and reusing');
+            } else {
+              console.log('Create Contact dialog still open — closing and searching existing contact');
             }
-          });
-          await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().waitFor({ timeout: 15000 });
+            await page.keyboard.press('Escape');
+            await createDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+            const closeBtn = createDialog.getByRole('button', { name: /Close|Cancel/i }).first();
+            if (await closeBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await closeBtn.click();
+              await createDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+            }
+          }
+          await page.getByRole('combobox', { name: /Search by Contacts/i }).fill(data.fullName);
+          await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().waitFor({ timeout: 30000 });
       }
       {
 
           await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().click();
-          await page.getByRole('button', { name: 'Create Lead' }).click();
+          const existingLeadLink = page.getByRole('link', { name: /View Lead|Open Lead|Lead Details/i })
+            .or(page.getByRole('button', { name: /View Lead/i }));
+          if (await existingLeadLink.first().isVisible({ timeout: 5000 }).catch(() => false)) {
+            console.log('Lead already exists for contact — opening existing lead');
+            await existingLeadLink.first().click();
+            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 30000 });
+          } else {
+          const createLeadBtn = page.getByRole('link', { name: /Create Lead/i })
+            .or(page.getByRole('button', { name: 'Create Lead' }))
+            .first();
+          await createLeadBtn.click();
+          await Promise.race([
+            page.waitForURL(/\/crm\/leads\/create/, { timeout: 30000 }),
+            page.getByRole('dialog').filter({ hasText: /Create New Lead/i }).waitFor({ state: 'visible', timeout: 30000 }),
+            page.getByRole('heading', { name: /Create New Lead/i }).waitFor({ state: 'visible', timeout: 30000 }),
+          ]).catch(async () => {
+            await createLeadBtn.click();
+            await page.waitForURL(/\/crm\/leads\/create/, { timeout: 30000 });
+          });
 
-          const leadDialog = page.getByRole('dialog').filter({ hasText: 'Create New Lead' });
-          const leadForm = await leadDialog.isVisible({ timeout: 10000 }).catch(() => false)
+          const leadDialog = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
+          const leadForm = await leadDialog.isVisible({ timeout: 5000 }).catch(() => false)
             ? leadDialog
-            : page.getByRole('heading', { name: 'Create New Lead' }).locator('xpath=ancestor::main[1]');
+            : page.locator('main').last();
 
           await leadForm.waitFor({ state: 'visible', timeout: 15000 });
+          await page.getByRole('heading', { name: /Create New Lead/i }).waitFor({ timeout: 15000 }).catch(() => undefined);
+
+          await fillIndiaPhoneInLeadForm(leadForm, data.mobile);
+          const nationality = leadForm.getByRole('combobox', { name: /e\.g\., UAE|nationality/i }).first();
+          if (await nationality.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await nationality.click();
+            const search = page.getByRole('textbox', { name: 'Search...' });
+            if (await search.isVisible({ timeout: 2000 }).catch(() => false)) {
+              await search.fill('indian');
+            }
+            const indian = page.getByRole('option', { name: 'Indian', exact: true });
+            if (await indian.isVisible({ timeout: 3000 }).catch(() => false)) {
+              await indian.click();
+            } else {
+              await page.keyboard.press('Escape').catch(() => undefined);
+            }
+          }
 
           const scrollArea = leadForm.locator('div.overflow-y-auto, div[class*="overflow-y"]').last();
           if (await scrollArea.count()) {
             await scrollArea.evaluate((el) => { el.scrollTop = el.scrollHeight; });
           } else {
-            await leadForm.evaluate((el) => { el.scrollTop = el.scrollHeight; });
+            await leadForm.evaluate((el) => { el.scrollTop = el.scrollHeight; }).catch(() => undefined);
           }
 
-          const submitLeadBtn = leadForm.getByRole('button', { name: 'Create', exact: true }).last();
+          const submitLeadBtn = leadForm.getByRole('button', { name: 'Create', exact: true }).last()
+            .or(page.getByRole('button', { name: 'Create', exact: true }).last());
           await submitLeadBtn.scrollIntoViewIfNeeded();
           await expect(submitLeadBtn).toBeVisible();
           await expect(submitLeadBtn).toBeEnabled();
@@ -350,18 +374,41 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           try {
             await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 20000 });
           } catch {
-            await leadForm.press('End');
-            await submitLeadBtn.click({ force: true });
-            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
+            const duplicateLead = page.getByText(/lead with this email and phone number already exists/i);
+            if (await duplicateLead.isVisible({ timeout: 3000 }).catch(() => false)) {
+              console.log('Duplicate lead detected — opening existing lead');
+              await openExistingLead(page, data.fullName);
+            } else {
+              await leadForm.press('End').catch(() => undefined);
+              await submitLeadBtn.click({ force: true });
+              try {
+                await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
+              } catch {
+                await openExistingLead(page, data.fullName);
+              }
+            }
+          }
           }
           await page.getByRole('button', { name: 'Convert to Deal' }).waitFor({ timeout: 30000 });
       }
       {
 
-          await page.getByRole('button', { name: 'Convert to Deal' }).click();
+          const convertBtn = page.getByRole('button', { name: 'Convert to Deal' });
+          await convertBtn.scrollIntoViewIfNeeded();
+          await convertBtn.click();
           const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
-          await convertDialog.getByRole('combobox', { name: 'Select payment type...' }).click();
-          await page.getByRole('option').first().click();
+          const dialogVisible = await convertDialog.waitFor({ state: 'visible', timeout: 10000 }).then(() => true).catch(() => false);
+          if (!dialogVisible) {
+            await convertBtn.click({ force: true });
+            await convertDialog.waitFor({ state: 'visible', timeout: 20000 });
+          }
+          const paymentCombo = convertDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
+            .or(convertDialog.getByText(/Select payment type/i));
+          await paymentCombo.first().waitFor({ state: 'visible', timeout: 15000 });
+          await paymentCombo.first().click();
+          const paymentOptions = page.getByRole('option');
+          await paymentOptions.first().waitFor({ state: 'visible', timeout: 10000 });
+          await paymentOptions.first().click();
           await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
           await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
           if (!page.url().includes('/crm/deals/')) {
@@ -441,18 +488,12 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           await page.getByRole('tab', { name: 'Action Buttons' }).click();
           await page.getByRole('button', { name: /Create Tenant User/i }).click();
-          const tenantDialog = page.getByRole('dialog');
-          if (await tenantDialog.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await tenantDialog.getByRole('button', { name: /Create|Confirm|Yes|Submit/i }).click();
-            const dialogPassword = await captureTenantPasswordFromDialog(page);
-            if (dialogPassword) {
-              passwordCapture.setPassword(dialogPassword);
-              console.log('Tenant password captured from dialog');
-            }
-            await tenantDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => {});
+          const dialogPassword = await confirmCreateTenantUserAndCapturePassword(page, passwordCapture);
+          if (dialogPassword) {
+            console.log('Tenant password captured for tenant user');
           }
           if (!passwordCapture.getPassword()) {
-            yopmailCredentialsPromise = startYopmailCredentialPolling(context, data.email, page);
+            gmailCredentialsPromise = startGmailCredentialPolling(context, data.email, page);
           }
       }
       {
@@ -494,7 +535,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           const tenantCredentials = await resolveTenantCredentials({
             capturedPassword: passwordCapture.getPassword(),
-            yopmailPromise: yopmailCredentialsPromise,
+            gmailPromise: gmailCredentialsPromise,
             page,
             context,
             email: data.email,
@@ -508,7 +549,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
 
           if (tenantCredentials.password) {
             await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-            await fillLoginFields(page, 'test240', data.email, tenantCredentials.password);
+            await fillLoginFields(page, EXISTING_ORG_ADMIN.orgId, data.email, tenantCredentials.password);
             await page.getByRole('button', { name: 'Sign In' }).click();
 
             const invalidCredentials = page.getByText('Invalid credentials');
@@ -521,8 +562,8 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
             const loginResult = await Promise.race([leftLogin, sawInvalid]);
 
             if (loginResult === 'invalid') {
-              console.log('Login failed — retrying with fresh YOPmail fetch');
-              const retryCredentials = await getTenantCredentialsFromYopmail(page, data.email);
+              console.log('Login failed — retrying with fresh IMAP fetch');
+              const retryCredentials = await getTenantCredentialsFromImap(data.email, 120_000);
               tenantPassword = retryCredentials.password;
               const passwordField = page.getByRole('textbox', { name: /^Password$/i }).or(page.locator('#password'));
               await passwordField.first().fill('');
@@ -553,7 +594,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
       }
       {
 
-          await fillLoginFields(page, 'test240', 'test240@yopmail.com', 'Test2026$');
+          await fillLoginFields(page, EXISTING_ORG_ADMIN.orgId, EXISTING_ORG_ADMIN.email, EXISTING_ORG_ADMIN.password);
           await page.getByRole('button', { name: 'Sign In' }).click();
           await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
       }
@@ -637,7 +678,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           if (!tenantPassword) {
             const refreshed = await resolveTenantCredentials({
               capturedPassword: passwordCapture.getPassword(),
-              yopmailPromise: yopmailCredentialsPromise,
+              gmailPromise: gmailCredentialsPromise,
               page,
               context,
               email: data.email,
@@ -649,7 +690,7 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
           }
 
           await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-          await fillLoginFields(page, 'test240', data.email, tenantPassword);
+          await fillLoginFields(page, EXISTING_ORG_ADMIN.orgId, data.email, tenantPassword);
           await page.getByRole('button', { name: 'Sign In' }).click();
           await page.waitForURL(
             (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
@@ -712,9 +753,11 @@ test('Propexcel end-to-end flow', async ({ page, context }) => {
     mobile: data.mobile,
     propertyName: data.propertyName,
     password: tenantPassword,
-    orgId: 'test240',
+    orgId: EXISTING_ORG_ADMIN.orgId,
     moveInDate,
   });
+
+  commitSequentialTenantIdentity(data.tenantNumber);
 
   passwordCapture.dispose();
 });

@@ -1,30 +1,27 @@
 import { test, expect } from '@playwright/test';
 import { loadSharedOrgData } from '../utils/SharedOrgData';
 import { saveSharedCrmData } from '../utils/SharedCrmData';
+import {
+  commitSequentialTenantIdentity,
+  fillIndiaPhoneInContactDialog,
+  fillIndiaPhoneInLeadForm,
+  peekNextSequentialTenantIdentity,
+} from '../utils/SharedTenantContactData';
 
 type PersonData = {
   fullName: string;
   email: string;
   mobile: string;
+  tenantNumber: number;
 };
 
-/** Random data for contacts (prefix: contact). */
-function generateContactData(index: number): PersonData {
-  const suffix = `${Date.now().toString().slice(-6)}c${index}`;
+function peekTenantPerson(): PersonData {
+  const tenant = peekNextSequentialTenantIdentity();
   return {
-    fullName: `contact${suffix}`,
-    email: `contact${suffix}@yopmail.com`,
-    mobile: `9${Math.floor(100000000 + Math.random() * 900000000)}`,
-  };
-}
-
-/** Random data for leads (prefix: lead) — independent from contacts. */
-function generateLeadData(index: number): PersonData {
-  const suffix = `${Date.now().toString().slice(-6)}l${index}`;
-  return {
-    fullName: `lead${suffix}`,
-    email: `lead${suffix}@yopmail.com`,
-    mobile: `8${Math.floor(100000000 + Math.random() * 900000000)}`,
+    fullName: tenant.fullName,
+    email: tenant.email,
+    mobile: tenant.mobile,
+    tenantNumber: tenant.number,
   };
 }
 
@@ -107,8 +104,26 @@ async function dismissNotificationsModal(page: import('@playwright/test').Page) 
 
 async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabel: string) {
   const btn = page.locator(`button[aria-label="${ariaLabel}"]`).first();
-  await btn.waitFor({ state: 'attached', timeout: 15000 });
-  await btn.evaluate((el) => (el as HTMLElement).click());
+  if (await btn.count()) {
+    try {
+      await btn.waitFor({ state: 'attached', timeout: 8000 });
+      await btn.evaluate((el) => (el as HTMLElement).click());
+      return;
+    } catch {
+      // Fall through to URL navigation
+    }
+  }
+  const fallbacks: Record<string, string> = {
+    Accounts: 'https://test.propexcel.com/accounts',
+    CRM: 'https://test.propexcel.com/crm/contacts',
+    Property: 'https://test.propexcel.com/property/properties',
+    Admin: 'https://test.propexcel.com/admin',
+    Settings: 'https://test.propexcel.com/admin/settings',
+  };
+  const url = fallbacks[ariaLabel];
+  if (!url) throw new Error(`Top nav module not found: ${ariaLabel}`);
+  console.log(`Top nav "${ariaLabel}" not found — navigating to ${url}`);
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
 }
 
 async function goToCrmContacts(page: import('@playwright/test').Page) {
@@ -146,25 +161,23 @@ async function goToCrmLeads(page: import('@playwright/test').Page) {
   await page.getByRole('heading', { name: /Leads/i }).first().waitFor({ timeout: 30000 }).catch(() => undefined);
 }
 
-/** Create Contact — Flow1 contact steps; uses contact* random data. */
+/** Create Contact — sequential tenantN + India (+91) mobile. */
 async function createContact(page: import('@playwright/test').Page, data: PersonData) {
   await dismissEndToEndFlowTour(page);
   await page.getByRole('button', { name: 'Create Contact' }).click();
-  await page.getByRole('dialog', { name: 'Create New Contact' }).waitFor();
-  await page.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
-  await page.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
-  await page.getByRole('textbox', { name: 'Enter mobile number' }).fill(data.mobile);
-  await page.getByRole('combobox', { name: 'Enter nationality' }).click();
-  await page.getByRole('textbox', { name: 'Search...' }).fill('indian');
-  await page.getByRole('option', { name: 'Indian' }).click();
   const createDialog = page.getByRole('dialog', { name: 'Create New Contact' });
-  await page.getByRole('button', { name: 'Create Contact' }).click();
-  await createDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(async () => {
-    if (await createDialog.isVisible()) {
-      await createDialog.getByRole('button', { name: 'Close' }).click();
-    }
-  });
-  await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().waitFor({ timeout: 15000 });
+  await createDialog.waitFor();
+  await createDialog.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
+  await createDialog.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
+  await fillIndiaPhoneInContactDialog(createDialog, data.mobile);
+  await createDialog.getByRole('combobox', { name: 'Enter nationality' }).click();
+  await createDialog.getByRole('textbox', { name: 'Search...' }).fill('indian');
+  await page.getByRole('option', { name: 'Indian', exact: true }).click();
+  await createDialog.getByRole('button', { name: 'Create Contact' }).click();
+  await createDialog.waitFor({ state: 'hidden', timeout: 30000 });
+  await page.getByRole('combobox', { name: /Search by Contacts/i }).fill(data.fullName);
+  await page.locator('h3').filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') }).first().waitFor({ timeout: 30000 });
+  commitSequentialTenantIdentity(data.tenantNumber);
   console.log('Contact created:', data.fullName, data.email, data.mobile);
 }
 
@@ -221,11 +234,8 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
     .first();
   await emailField.fill(data.email);
 
-  // Mobile — placeholder "+1234567890"
-  const mobileField = leadForm.getByRole('textbox', { name: '+1234567890' })
-    .or(leadForm.getByPlaceholder('+1234567890'))
-    .first();
-  await mobileField.fill(data.mobile);
+  // Mobile — India +91
+  await fillIndiaPhoneInLeadForm(leadForm, data.mobile);
 
   // Nationality — placeholder "e.g., UAE"
   const nationality = leadForm.getByRole('combobox', { name: /e\.g\., UAE|nationality/i }).first();
@@ -235,7 +245,7 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
     if (await search.isVisible({ timeout: 2000 }).catch(() => false)) {
       await search.fill('indian');
     }
-    const indian = page.getByRole('option', { name: 'Indian' });
+    const indian = page.getByRole('option', { name: 'Indian', exact: true });
     if (await indian.isVisible({ timeout: 3000 }).catch(() => false)) {
       await indian.click();
     } else {
@@ -272,7 +282,9 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
   // Convert Lead to Deal modal → random Payment Type → Convert to Deal
   const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
   await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
-  await convertDialog.getByRole('combobox', { name: 'Select payment type...' }).click();
+  const paymentCombo = convertDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
+    .or(convertDialog.getByText(/Select payment type/i));
+  await paymentCombo.first().click();
   const paymentOptions = page.getByRole('option');
   await paymentOptions.first().waitFor({ state: 'visible', timeout: 10000 });
   const paymentCount = await paymentOptions.count();
@@ -282,21 +294,22 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
   console.log(`Payment Type -> [${paymentIndex + 1}/${paymentCount}] ${paymentLabel}`);
   await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
   await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
+  commitSequentialTenantIdentity(data.tenantNumber);
   console.log('Converted lead to deal:', data.fullName, data.email, data.mobile);
 }
 
-test('Creating Contacts and Leads (4 each, separate random data)', async ({ page, context }) => {
+test('Creating Contacts and Leads (4 each, sequential tenantN)', async ({ page, context }) => {
   const admin = loadSharedOrgData();
-  const contacts: PersonData[] = Array.from({ length: 4 }, (_, i) => generateContactData(i));
-  const leads: PersonData[] = Array.from({ length: 4 }, (_, i) => generateLeadData(i));
+  const contacts: PersonData[] = [];
+  const leads: PersonData[] = [];
 
   console.log('Admin login (from CreateOrganization org.json):', {
     orgId: admin.orgId,
     email: admin.email,
     orgName: admin.orgName,
   });
-  console.log('Contacts to create:', contacts);
-  console.log('Leads to create (different details):', leads);
+  console.log('Contacts to create: (peeked one at a time during run)');
+  console.log('Leads to create: (peeked one at a time during run)');
 
   test.setTimeout(400_000);
   page.setDefaultTimeout(30_000);
@@ -313,18 +326,22 @@ test('Creating Contacts and Leads (4 each, separate random data)', async ({ page
     await dismissNotificationsModal(page);
   }
 
-  // Phase 1: CRM → Contacts → create 4 contacts (random set A)
+  // Phase 1: CRM → Contacts → create 4 contacts (tenantN sequential)
   {
     await goToCrmContacts(page);
-    for (let i = 0; i < contacts.length; i++) {
-      await createContact(page, contacts[i]);
+    for (let i = 0; i < 4; i++) {
+      const person = peekTenantPerson();
+      await createContact(page, person);
+      contacts.push(person);
     }
   }
 
-  // Phase 2: Left sidebar → Leads → create 4 leads (random set B, not from contacts)
+  // Phase 2: Left sidebar → Leads → create 4 leads (next tenantN sequence)
   {
-    for (let i = 0; i < leads.length; i++) {
-      await createLeadStandalone(page, leads[i]);
+    for (let i = 0; i < 4; i++) {
+      const person = peekTenantPerson();
+      await createLeadStandalone(page, person);
+      leads.push(person);
     }
   }
 
@@ -333,8 +350,8 @@ test('Creating Contacts and Leads (4 each, separate random data)', async ({ page
     saveSharedCrmData({
       orgId: admin.orgId,
       orgName: admin.orgName,
-      contacts,
-      leads,
+      contacts: contacts.map(({ fullName, email, mobile }) => ({ fullName, email, mobile })),
+      leads: leads.map(({ fullName, email, mobile }) => ({ fullName, email, mobile })),
     });
   }
 });

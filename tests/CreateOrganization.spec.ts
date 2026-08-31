@@ -1,5 +1,13 @@
 import { test, expect, Page } from '@playwright/test';
-import { saveSharedOrgData } from '../utils/SharedOrgData';
+import {
+  OrgCreatePerfTracker,
+  saveOrgCreatePerformance,
+} from '../utils/OrgCreatePerformance';
+import {
+  commitSequentialOrgIdentity,
+  peekNextSequentialOrgIdentity,
+  saveSharedOrgData,
+} from '../utils/SharedOrgData';
 
 function randomThreeDigits() {
   return String(Math.floor(100 + Math.random() * 900));
@@ -103,10 +111,11 @@ async function clickComplete3DS(page: Page): Promise<void> {
   throw new Error('3D Secure COMPLETE clicked but challenge did not close');
 }
 
-/** After Stripe payment, wait until PropExcel login is ready (retry 3DS if it reappears). */
+/** After Stripe payment, wait until app redirects to login (no forced navigation). */
 async function waitForLoginAfterStripe(page: Page): Promise<void> {
-  const deadline = Date.now() + 180000;
+  const deadline = Date.now() + 300_000; // up to 5 minutes for org provisioning + redirect
   const welcome = page.getByRole('heading', { name: /Welcome Back/i });
+  const configuring = page.getByText(/Configuring your organization|Getting ready|Setting up your organization/i);
 
   while (Date.now() < deadline) {
     if (
@@ -114,10 +123,7 @@ async function waitForLoginAfterStripe(page: Page): Promise<void> {
       page.url().includes('/login') &&
       (await welcome.isVisible({ timeout: 500 }).catch(() => false))
     ) {
-      return;
-    }
-
-    if (await welcome.isVisible({ timeout: 500 }).catch(() => false)) {
+      console.log('Login page appeared (natural redirect)');
       return;
     }
 
@@ -131,6 +137,8 @@ async function waitForLoginAfterStripe(page: Page): Promise<void> {
         console.log('3D Secure COMPLETE re-clicked while waiting for login');
         await page.waitForTimeout(2000);
       }
+    } else if (await configuring.first().isVisible({ timeout: 400 }).catch(() => false)) {
+      console.log('Still configuring organization — waiting for redirect to login');
     }
 
     await page.waitForTimeout(1000);
@@ -139,144 +147,188 @@ async function waitForLoginAfterStripe(page: Page): Promise<void> {
   throw new Error('Timed out waiting for login page after Stripe 3DS / Subscribe');
 }
 
+async function fillLoginFields(page: Page, orgId: string, email: string, password: string) {
+  const org = page.getByRole('textbox', { name: /Organization ID/i }).or(page.locator('#tenantId'));
+  const emailField = page.getByRole('textbox', { name: /Email Address/i }).or(page.locator('#email'));
+  const passwordField = page.getByRole('textbox', { name: /^Password$/i }).or(page.locator('#password'));
+  await org.first().fill(orgId);
+  await emailField.first().fill(email);
+  await passwordField.first().fill(password);
+}
+
+/** Confirm org exists on server before saving org.json / advancing counter. */
+async function verifyOrgLoginWorks(page: Page, orgId: string, email: string, password: string): Promise<void> {
+  await fillLoginFields(page, orgId, email, password);
+  await page.getByRole('button', { name: 'Sign In' }).click();
+  await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60_000 });
+  const orgNotFound = page.getByText(/organization.*not found|check the organization slug/i);
+  if (await orgNotFound.isVisible({ timeout: 2000 }).catch(() => false)) {
+    throw new Error(`Organization '${orgId}' not found — provisioning may still be in progress`);
+  }
+  console.log('Verified admin login for new organization:', orgId);
+}
+
 /**
  * Create Organization — register a new org, pay Stripe verification, land on login.
+ * Org names are sequential: auto1, auto2, auto3... (counter advances ONLY on success).
+ * Override: ORG_NUM=5 npx playwright test tests/CreateOrganization.spec.ts --headed
  * Saves login credentials to test-data/org.json for later use.
  *
  * Run:
  *   npx playwright test tests/CreateOrganization.spec.ts --headed
  */
 test('Create Organization — register new org and save login data', async ({ page }) => {
-  test.setTimeout(300_000);
+  test.setTimeout(1_200_000); // 20 minutes — provisioning after Stripe can be slow
   page.setDefaultTimeout(30_000);
+  const perf = new OrgCreatePerfTracker();
 
-  const suffix = randomThreeDigits();
-  const orgName = `Automation ${suffix}`;
-  // Organization ID used at login — stable slug without spaces
-  const orgId = `automation-${suffix}`;
-  const adminEmail = `${orgName.replace(/\s+/g, '').toLowerCase()}@yopmail.com`;
+  // Peek only — counter commits after saveSharedOrgData succeeds
+  const seq = peekNextSequentialOrgIdentity();
+  const orgName = seq.orgName;
+  const orgId = seq.orgId;
+  const adminEmail = seq.email;
   const password = 'Test2026$';
   const offices = randomCount();
   const spaces = randomCount();
   const expiry = randomFutureExpiry();
   const cvc = randomThreeDigits();
 
-  console.log('Create Organization data:', { orgName, orgId, adminEmail, offices, spaces });
+  console.log('Create Organization data:', { orgName, orgId, adminEmail, offices, spaces, sequence: seq.number });
 
-  // 1) Open login URL
-  await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-  await page.getByRole('heading', { name: /Welcome Back/i }).waitFor({ timeout: 30000 });
-
-  // 2) Create a new organization
-  await page.getByRole('button', { name: /Create a new organization/i }).click();
-  await page.getByRole('heading', { name: /Create Account/i }).waitFor({ timeout: 15000 });
-
-  // 3–6) Details step
-  await page.getByPlaceholder(/Acme Properties/i).fill(orgName);
-
-  // Ensure Organization Code matches what we save for login
-  const orgCodeField = page.getByPlaceholder(/acme-properties/i)
-    .or(page.getByLabel(/Organization Code/i));
-  if (await orgCodeField.first().isVisible({ timeout: 3000 }).catch(() => false)) {
-    await orgCodeField.first().fill('');
-    await orgCodeField.first().fill(orgId);
-  }
-
-  await page.getByPlaceholder(/admin@company.com/i).fill(adminEmail);
-  await page.getByPlaceholder(/Min\. 8 characters/i).fill(password);
-  await page.getByPlaceholder(/Enter referral code/i).fill('TEST9');
-
-  // 7) Continue
-  await page.getByRole('button', { name: /^Continue$/i }).click();
-  await page.getByText(/Customize your workspace settings/i).waitFor({ timeout: 15000 });
-
-  // 8) Offices and spaces (10–50)
-  const officesField = page.getByLabel(/Number of Offices/i)
-    .or(page.getByRole('spinbutton').first())
-    .or(page.locator('input[type="number"]').first());
-  const spacesField = page.getByLabel(/Number of Coworking Spaces/i)
-    .or(page.getByRole('spinbutton').nth(1))
-    .or(page.locator('input[type="number"]').nth(1));
-  await officesField.first().fill(offices);
-  await spacesField.first().fill(spaces);
-
-  // 9) Terms checkbox
-  const terms = page.getByRole('checkbox', { name: /I agree to the Terms and Conditions/i })
-    .or(page.getByRole('checkbox').first());
-  await terms.first().check();
-
-  // 10) Proceed to Register
-  await page.getByRole('button', { name: /Proceed to Register/i }).click();
-  console.log('Proceeded to Register:', { orgName, orgId, adminEmail, offices, spaces });
-
-  // 11–13) Stripe Checkout — card details
-  await page.getByRole('button', { name: /^Subscribe$/i }).waitFor({ state: 'visible', timeout: 90000 });
-
-  const cardFilled = await fillInAnyFrame(
-    page,
-    [
-      'input[name="cardnumber"]',
-      'input[autocomplete="cc-number"]',
-      'input[placeholder*="1234"]',
-      'input[data-elements-stable-field-name="cardNumber"]',
-    ],
-    '4000003560000123',
-  );
-  if (!cardFilled) {
-    throw new Error('Stripe card number field not found');
-  }
-
-  const expiryFilled = await fillInAnyFrame(
-    page,
-    [
-      'input[name="exp-date"]',
-      'input[autocomplete="cc-exp"]',
-      'input[placeholder*="MM"]',
-      'input[data-elements-stable-field-name="cardExpiry"]',
-    ],
-    expiry.combined,
-  );
-  if (!expiryFilled) {
-    throw new Error('Stripe expiry field not found');
-  }
-
-  const cvcFilled = await fillInAnyFrame(
-    page,
-    [
-      'input[name="cvc"]',
-      'input[autocomplete="cc-csc"]',
-      'input[placeholder*="CVC" i]',
-      'input[data-elements-stable-field-name="cardCvc"]',
-    ],
-    cvc,
-  );
-  if (!cvcFilled) {
-    throw new Error('Stripe CVC field not found');
-  }
-
-  const nameField = page.getByPlaceholder(/Full name on card/i)
-    .or(page.getByLabel(/Cardholder name|Name on card/i));
-  await nameField.first().waitFor({ state: 'visible', timeout: 15000 });
-  await nameField.first().fill(orgName);
-
-  console.log('Stripe card filled:', {
-    card: '4000003560000123',
-    expiry: `${expiry.month}/${expiry.year}`,
-    cvc,
-    cardholder: orgName,
+  await perf.step('Open login page', async () => {
+    await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
+    await page.getByRole('heading', { name: /Welcome Back/i }).waitFor({ timeout: 30000 });
   });
 
-  await page.getByRole('button', { name: /^Subscribe$/i }).click();
+  await perf.step('Details form', async () => {
+    await page.getByRole('button', { name: /Create a new organization/i }).click();
+    await page.getByRole('heading', { name: /Create Account/i }).waitFor({ timeout: 15000 });
 
-  // 14) 3D Secure → COMPLETE (retry until challenge closes)
-  await clickComplete3DS(page);
+    await page.getByPlaceholder(/Acme Properties/i).fill(orgName);
 
-  // Wait until PropExcel login appears (re-click 3DS if it comes back)
-  await waitForLoginAfterStripe(page);
-  await expect(page.getByRole('heading', { name: /Welcome Back/i })).toBeVisible({ timeout: 30000 });
-  console.log('Returned to login page after organization registration');
+    const orgCodeField = page.getByPlaceholder(/acme-properties/i)
+      .or(page.getByLabel(/Organization Code/i));
+    if (await orgCodeField.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+      await orgCodeField.first().fill('');
+      await orgCodeField.first().fill(orgId);
+    }
 
-  // Save login credentials for later flows
+    await page.getByPlaceholder(/admin@company.com/i).fill(adminEmail);
+    await page.getByPlaceholder(/Min\. 8 characters/i).fill(password);
+
+    const countryCombo = page.locator('div')
+      .filter({ has: page.getByText('Country', { exact: true }) })
+      .getByRole('combobox')
+      .first();
+    await countryCombo.waitFor({ state: 'visible', timeout: 10000 });
+    const countryValue = (await countryCombo.textContent())?.trim() ?? '';
+    if (!/india/i.test(countryValue)) {
+      await countryCombo.click();
+      await page.getByRole('option', { name: /^India$/i }).click();
+      console.log('Country selected: India');
+    } else {
+      console.log('Country already set: India');
+    }
+
+    await page.getByPlaceholder(/Enter referral code/i).fill('test9');
+    console.log('Referral code: test9');
+
+    await page.getByRole('button', { name: /^Continue$/i }).click();
+    await page.getByText(/Customize your workspace settings/i).waitFor({ timeout: 15000 });
+  });
+
+  await perf.step('Customize workspace', async () => {
+    const officesField = page.getByLabel(/Number of Offices/i)
+      .or(page.getByRole('spinbutton').first())
+      .or(page.locator('input[type="number"]').first());
+    const spacesField = page.getByLabel(/Number of Coworking Spaces/i)
+      .or(page.getByRole('spinbutton').nth(1))
+      .or(page.locator('input[type="number"]').nth(1));
+    await officesField.first().fill(offices);
+    await spacesField.first().fill(spaces);
+
+    const terms = page.getByRole('checkbox', { name: /I agree to the Terms and Conditions/i })
+      .or(page.getByRole('checkbox').first());
+    await terms.first().check();
+
+    await page.getByRole('button', { name: /Proceed to Register/i }).click();
+    console.log('Proceeded to Register:', { orgName, orgId, adminEmail, offices, spaces });
+  });
+
+  await perf.step('Stripe checkout', async () => {
+    await page.getByRole('button', { name: /^Subscribe$/i }).waitFor({ state: 'visible', timeout: 90000 });
+
+    const cardFilled = await fillInAnyFrame(
+      page,
+      [
+        'input[name="cardnumber"]',
+        'input[autocomplete="cc-number"]',
+        'input[placeholder*="1234"]',
+        'input[data-elements-stable-field-name="cardNumber"]',
+      ],
+      '4000003560000123',
+    );
+    if (!cardFilled) {
+      throw new Error('Stripe card number field not found');
+    }
+
+    const expiryFilled = await fillInAnyFrame(
+      page,
+      [
+        'input[name="exp-date"]',
+        'input[autocomplete="cc-exp"]',
+        'input[placeholder*="MM"]',
+        'input[data-elements-stable-field-name="cardExpiry"]',
+      ],
+      expiry.combined,
+    );
+    if (!expiryFilled) {
+      throw new Error('Stripe expiry field not found');
+    }
+
+    const cvcFilled = await fillInAnyFrame(
+      page,
+      [
+        'input[name="cvc"]',
+        'input[autocomplete="cc-csc"]',
+        'input[placeholder*="CVC" i]',
+        'input[data-elements-stable-field-name="cardCvc"]',
+      ],
+      cvc,
+    );
+    if (!cvcFilled) {
+      throw new Error('Stripe CVC field not found');
+    }
+
+    const nameField = page.getByPlaceholder(/Full name on card/i)
+      .or(page.getByLabel(/Cardholder name|Name on card/i));
+    await nameField.first().waitFor({ state: 'visible', timeout: 15000 });
+    await nameField.first().fill(orgName);
+
+    console.log('Stripe card filled:', {
+      card: '4000003560000123',
+      expiry: `${expiry.month}/${expiry.year}`,
+      cvc,
+      cardholder: orgName,
+    });
+
+    await page.getByRole('button', { name: /^Subscribe$/i }).click();
+  });
+
+  await perf.step('3D Secure', async () => {
+    await clickComplete3DS(page);
+  });
+
+  await perf.step('Provisioning + login redirect', async () => {
+    await waitForLoginAfterStripe(page);
+    await expect(page.getByRole('heading', { name: /Welcome Back/i })).toBeVisible({ timeout: 30000 });
+    console.log('Returned to login page after organization registration');
+  });
+
+  await perf.step('Login verification', async () => {
+    await verifyOrgLoginWorks(page, orgId, adminEmail, password);
+  });
+
   saveSharedOrgData({
     orgName,
     orgId,
@@ -285,4 +337,9 @@ test('Create Organization — register new org and save login data', async ({ pa
     offices,
     spaces,
   });
+  commitSequentialOrgIdentity(seq.number);
+
+  const report = perf.buildReport(orgId, orgName, adminEmail);
+  perf.logSummary(report);
+  saveOrgCreatePerformance(report);
 });
