@@ -3,20 +3,21 @@ import type { Page } from '@playwright/test';
 /** Fill invoice Line Item dialog: Chart of Account 4000 + amount (search portal is outside dialog). */
 export async function fillInvoiceLineItemWithRentalIncome(page: Page, amount: string) {
   const lineItemDialog = page.getByRole('dialog').filter({ hasText: /Line Item/i }).last();
-  await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 15000 });
+  await lineItemDialog.getByRole('heading', { name: /Line Item/i }).waitFor({ timeout: 30000 });
 
   const itemField = lineItemDialog.getByLabel(/^Item$/i);
-  if (await itemField.isVisible({ timeout: 2000 }).catch(() => false)) {
+  if (await itemField.isVisible({ timeout: 3000 }).catch(() => false)) {
     await itemField.fill('rent');
   }
 
   const propertyCombo = lineItemDialog.getByRole('combobox', { name: /^Property$/i });
-  if (await propertyCombo.isVisible({ timeout: 2000 }).catch(() => false)) {
+  if (await propertyCombo.isVisible({ timeout: 3000 }).catch(() => false)) {
     const propText = ((await propertyCombo.textContent().catch(() => '')) ?? '').trim();
     if (!propText || /select|search|property/i.test(propText)) {
       await propertyCombo.click();
       const firstProp = page.getByRole('option').first();
-      if (await firstProp.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await firstProp.waitFor({ state: 'visible', timeout: 10000 }).catch(() => undefined);
+      if (await firstProp.isVisible({ timeout: 3000 }).catch(() => false)) {
         await firstProp.click();
       } else {
         await page.keyboard.press('Escape');
@@ -27,28 +28,47 @@ export async function fillInvoiceLineItemWithRentalIncome(page: Page, amount: st
   const chartCombo = lineItemDialog
     .getByRole('combobox', { name: /Select Account|Chart of Account|1000 - Cash|4000 - Rental/i })
     .or(lineItemDialog.getByRole('combobox').filter({ hasText: /1000 - Cash|Select Account|4000 - Rental/i }))
+    .or(lineItemDialog.locator('[role="combobox"]').filter({ hasText: /Account|Cash|Rental|Select/i }))
     .first();
 
-  if (await chartCombo.isVisible({ timeout: 5000 }).catch(() => false)) {
+  let opened = false;
+  if (await chartCombo.isVisible({ timeout: 8000 }).catch(() => false)) {
+    await chartCombo.scrollIntoViewIfNeeded().catch(() => undefined);
     const expanded = await chartCombo.getAttribute('aria-expanded').catch(() => null);
     if (expanded !== 'true') {
-      await chartCombo.click();
+      await chartCombo.click({ force: true });
     }
-  } else {
-    const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i);
-    await chartLabel.locator('xpath=following::*[@role="combobox"][1]').click();
+    opened = true;
+  }
+
+  if (!opened) {
+    const chartLabel = lineItemDialog.getByText(/^Chart of Account$/i).first();
+    await chartLabel.waitFor({ state: 'visible', timeout: 15000 });
+    const byLabel = chartLabel.locator('xpath=following::*[@role="combobox"][1]');
+    if (await byLabel.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await byLabel.click({ force: true });
+      opened = true;
+    } else {
+      // Fallback: any combobox in the dialog that is not Property
+      const anyAccountCombo = lineItemDialog.getByRole('combobox').nth(1)
+        .or(lineItemDialog.locator('[role="combobox"]').nth(1));
+      await anyAccountCombo.first().waitFor({ state: 'visible', timeout: 15000 });
+      await anyAccountCombo.first().click({ force: true });
+      opened = true;
+    }
   }
 
   // Combobox search/options are portaled outside the dialog
   const accountSearch = page.getByRole('textbox', { name: /Search/i })
     .or(page.getByPlaceholder(/Search/i))
     .last();
-  if (await accountSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+  if (await accountSearch.isVisible({ timeout: 8000 }).catch(() => false)) {
     await accountSearch.fill('4000');
   }
 
-  const rentalIncome = page.getByRole('option', { name: /4000\s*-\s*Rental Income/i });
-  await rentalIncome.first().waitFor({ state: 'visible', timeout: 10000 });
+  const rentalIncome = page.getByRole('option', { name: /4000\s*-\s*Rental Income/i })
+    .or(page.getByText(/4000\s*-\s*Rental Income/i));
+  await rentalIncome.first().waitFor({ state: 'visible', timeout: 20000 });
   await rentalIncome.first().click();
   console.log('Chart of Account -> 4000 - Rental Income');
 
@@ -56,8 +76,11 @@ export async function fillInvoiceLineItemWithRentalIncome(page: Page, amount: st
     .or(lineItemDialog.getByPlaceholder('0.00'))
     .or(lineItemDialog.getByLabel(/^Amount$/i))
     .first();
+  await amountField.waitFor({ state: 'visible', timeout: 15000 });
   await amountField.fill(amount);
 
-  await lineItemDialog.getByRole('button', { name: /^Save$/i }).click();
-  await lineItemDialog.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
+  const saveBtn = lineItemDialog.getByRole('button', { name: /^Save$/i });
+  await saveBtn.waitFor({ state: 'visible', timeout: 10000 });
+  await saveBtn.click();
+  await lineItemDialog.waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
 }

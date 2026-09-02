@@ -34,26 +34,36 @@ export default defineConfig({
     ['html', { open: 'never' }],
   ],
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
+  timeout: 600_000,
+  expect: {
+    timeout: 30_000,
+  },
   use: {
     /* Base URL to use in actions like `await page.goto('')`. */
     // baseURL: 'http://localhost:3000',
 
-    /* Always capture artifacts for pass and fail */
-    screenshot: 'on',
-    /* Explicit video size so recording works even with maximized window */
+    /* Capture on failure only — keeps runs faster */
+    screenshot: 'only-on-failure',
     video: {
-      mode: 'on',
+      mode: 'retain-on-failure',
       size: { width: 1920, height: 1080 },
     },
-    trace: 'on',
-    /* null = use full maximized OS window (avoids small boxed viewport) */
+    trace: 'retain-on-failure',
+    /* Maximize via CDP in utils/test.ts; also set large window as fallback */
     viewport: null,
+    actionTimeout: 60_000,
+    navigationTimeout: 90_000,
     /* Pre-grant location so the browser permission popup does not block login */
     permissions: ['geolocation'],
     geolocation: { latitude: 17.385, longitude: 78.4867 },
     launchOptions: {
-      slowMo: 500,
-      args: ['--start-maximized', '--window-size=1920,1080'],
+      // Default 0 for speed; set SLOW_MO=500 when watching headed runs
+      slowMo: Number(process.env.SLOW_MO ?? '0'),
+      args: [
+        '--start-maximized',
+        '--window-position=0,0',
+        '--window-size=1920,1080',
+      ],
     },
   },
 

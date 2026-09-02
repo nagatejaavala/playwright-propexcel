@@ -99,13 +99,14 @@ def main() -> None:
         "tests/Cleanup Scenario.spec.ts, tests/CreateOrganization.spec.ts, "
         "tests/Flow1-ExistingOrganization.spec.ts, tests/Flow2-ExistingOrganization.spec.ts, "
         "tests/Flow1-NewOrganization.spec.ts, tests/Flow2-NewOrganization.spec.ts, "
-        "tests/Creating Contacts,Leads,Deals.spec.ts, tests/ExistingContact-ToTenantPayment.spec.ts, "
-        "tests/Skip lead flow - tenenat Payment.spec.ts, tests/Direct Lead to Tenant Payment.spec.ts"
+        "tests/Creating Contacts,Leads,Deals.spec.ts, tests/Existing Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts, "
+        "tests/Existing Contact → Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts, "
+        "tests/New Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts, tests/New Lead Creation (Auto-creates Contact) → Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts"
     )
     ws["B8"] = (
         "New Org chain: TC-00 Cleanup -> TC-03 CreateOrganization -> TC-04 Flow1-NewOrganization -> "
-        "TC-06 Creating Contacts,Leads,Deals -> TC-07 ExistingContact-ToTenantPayment -> "
-        "TC-08 Skip lead flow -> TC-09 Direct Lead to Tenant Payment -> TC-05 Flow2-NewOrganization (optional). "
+        "TC-06 Creating Contacts,Leads,Deals -> TC-10 Existing Deal -> TC-07 Existing Contact -> Deal -> "
+        "TC-08 New Deal -> TC-09 New Lead Creation -> TC-05 Flow2-NewOrganization (optional). "
         "Existing org chain: TC-01 Flow1-ExistingOrganization -> TC-02 Flow2-ExistingOrganization."
     )
     ws["B9"] = (
@@ -122,9 +123,10 @@ def main() -> None:
         ("TC-04", "New-org Flow 1: Razorpay, GST, Deal Approve, property, tenant, invoice, Razorpay. Script: Flow1-NewOrganization.spec.ts"),
         ("TC-05", "New-org Flow 2: request, vendor, task, bill, invoice, Razorpay. Script: Flow2-NewOrganization.spec.ts"),
         ("TC-06", "Create 4 contacts + 4 leads (tenantN sequential); save crm-contacts-leads.json. Script: Creating Contacts,Leads,Deals.spec.ts"),
-        ("TC-07", "Existing CRM contact -> lead/deal -> tenant -> rent invoice paid. Script: ExistingContact-ToTenantPayment.spec.ts"),
-        ("TC-08", "Skip lead: existing contact -> Create Deal -> tenant -> rent payment. Script: Skip lead flow - tenenat Payment.spec.ts"),
-        ("TC-09", "Direct lead: auto contact -> deal -> tenant -> rent payment. Script: Direct Lead to Tenant Payment.spec.ts"),
+        ("TC-10", "Existing deal (TC-06) -> contract -> tenant -> invoice -> payment. Script: Existing Deal spec"),
+        ("TC-07", "Existing CRM contact -> Create Deal (skip lead) -> tenant -> invoice -> payment. Script: Existing Contact spec"),
+        ("TC-08", "New Deal: existing contact -> Create Deal (skip lead) -> tenant -> invoice -> payment. Script: New Deal spec"),
+        ("TC-09", "New lead (auto contact) -> deal -> contract -> tenant -> invoice -> payment. Script: New Lead Creation (Auto-creates Contact) spec"),
     ]
     start_row = 13
     for i, (tc_id, desc) in enumerate(overview):
@@ -242,11 +244,37 @@ def main() -> None:
     write_test_sheet(
         wb,
         "TC-08_SkipLeadPayment",
-        "Skip lead - existing contact Create Deal through rent payment (new org)",
+        "New Deal - existing contact Create Deal through rent payment (new org)",
         "TC-08",
         "TC-03 and TC-06 completed; org.json and crm-contacts-leads.json exist.",
         payment_steps,
-        "tests/Skip lead flow - tenenat Payment.spec.ts",
+        "tests/New Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts",
+    )
+
+    existing_deal_steps = [
+        ("Super Admin", "Login using orgId, email, password from test-data/org.json", "Admin session starts"),
+        ("Super Admin", "CRM -> Deals -> search and open existing deal from crm-contacts-leads.json (TC-06)", "Deal Details page opens"),
+        ("Super Admin", "Add vacant property to deal, set rent/discount/GST, mark site visit done", "Deal property pricing saved"),
+        ("Super Admin", "Submit for Approval and complete Deal Approve workflow", "Deal is approved"),
+        ("Super Admin", "Create/view contract and approve contract", "Contract approved"),
+        ("Super Admin", "Create tenant user; password from dialog or IMAP", "Tenant user created"),
+        ("Super Admin", "Create move-in request and complete in Operations Requests", "Move-in completed"),
+        ("Super Admin", "Logout", "Login page displayed"),
+        ("Tenant", "Login with tenant credentials (IMAP or captured password)", "Tenant portal opens"),
+        ("Tenant", "Logout", "Login page displayed"),
+        ("Super Admin", "Create rent invoice (4000 Rental Income), submit/publish", "Invoice visible to tenant"),
+        ("Super Admin", "Logout", "Login page displayed"),
+        ("Tenant", "Pay invoice via Razorpay Netbanking -> Bank of Baroda -> Success", "Invoice status PAID"),
+    ]
+
+    write_test_sheet(
+        wb,
+        "TC-10_ExistingDealPayment",
+        "Existing Deal (TC-06) - contract through rent payment (new org)",
+        "TC-10",
+        "TC-03, TC-04, and TC-06 completed; org.json and crm-contacts-leads.json exist. GST and Deal Approve workflow already configured by Flow1.",
+        existing_deal_steps,
+        "tests/Existing Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts",
     )
 
     direct_lead_steps = [
@@ -269,14 +297,14 @@ def main() -> None:
     write_test_sheet(
         wb,
         "TC-09_DirectLeadPayment",
-        "Direct Lead - auto contact through rent payment (new org)",
+        "New Lead Creation (Auto-creates Contact) - deal through rent payment (new org)",
         "TC-09",
         "TC-03 completed; org.json exists with valid Super Admin credentials.",
         direct_lead_steps,
-        "tests/Direct Lead to Tenant Payment.spec.ts",
+        "tests/New Lead Creation (Auto-creates Contact) → Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts",
     )
 
-    # Reorder sheets: Summary first, then TC-00 through TC-09
+    # Reorder sheets: Summary first, then TC-00 through TC-10
     desired_order = [
         "Summary",
         "TC-00_Cleanup",
@@ -286,6 +314,7 @@ def main() -> None:
         "TC-04_Flow1_NewOrg",
         "TC-05_Flow2_NewOrg",
         "TC-06_ContactsLeadsDeals",
+        "TC-10_ExistingDealPayment",
         "TC-07_ExistingContactPayment",
         "TC-08_SkipLeadPayment",
         "TC-09_DirectLeadPayment",

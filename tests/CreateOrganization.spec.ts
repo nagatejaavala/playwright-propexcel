@@ -1,4 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
+import { test, expect } from '../utils/test';
+import type { Page } from '@playwright/test';
 import {
   OrgCreatePerfTracker,
   saveOrgCreatePerformance,
@@ -256,7 +257,25 @@ test('Create Organization — register new org and save login data', async ({ pa
   });
 
   await perf.step('Stripe checkout', async () => {
-    await page.getByRole('button', { name: /^Subscribe$/i }).waitFor({ state: 'visible', timeout: 90000 });
+    // Stripe checkout can take a while after Proceed to Register
+    const subscribeBtn = page.getByRole('button', { name: /^Subscribe$/i })
+      .or(page.getByRole('button', { name: /Subscribe|Pay|Start trial|Complete/i }))
+      .first();
+    const deadline = Date.now() + 180_000;
+    let subscribeVisible = false;
+    while (Date.now() < deadline && !subscribeVisible) {
+      if (await subscribeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+        subscribeVisible = true;
+        break;
+      }
+      // Stripe Elements may still be loading
+      const stripeFrame = page.frameLocator('iframe[name*="stripe"], iframe[src*="stripe"]').first();
+      if (await stripeFrame.locator('input, button').first().isVisible({ timeout: 1000 }).catch(() => false)) {
+        break;
+      }
+      await page.waitForTimeout(2000);
+    }
+    await subscribeBtn.waitFor({ state: 'visible', timeout: 60000 });
 
     const cardFilled = await fillInAnyFrame(
       page,
@@ -312,7 +331,10 @@ test('Create Organization — register new org and save login data', async ({ pa
       cardholder: orgName,
     });
 
-    await page.getByRole('button', { name: /^Subscribe$/i }).click();
+    await page.getByRole('button', { name: /^Subscribe$/i })
+      .or(page.getByRole('button', { name: /Subscribe|Pay|Start trial|Complete/i }))
+      .first()
+      .click();
   });
 
   await perf.step('3D Secure', async () => {

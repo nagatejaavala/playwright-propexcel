@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from '../utils/test';
 
 const PLATFORM_ORG_ID = 'propexcel';
 const PLATFORM_EMAIL = 'admin@propexcel.com';

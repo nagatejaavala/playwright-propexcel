@@ -1,20 +1,17 @@
 /**
- * Direct Lead → Tenant Payment
- * Login (org.json) → CRM Leads → Create New Lead (auto-creates Contact)
- * → verify contact exists (stop if not) → Convert to Deal → vacant property
- * → approve → contract → tenant → rent pay.
- * Does NOT configure Razorpay / GST / Deal Approve / Create Property / Create Contact
- * (assumes org already set up, e.g. after CreateOrg + Flow1).
- * Does not modify Flow1-NewOrganization.spec.ts.
- * Needs: org.json (+ vacant units, Razorpay, GST already on org).
+ * Existing Deal → Contract → Tenant → Invoice → Receive Payment
+ * Login (org.json) → CRM Deals → open existing deal (from crm-contacts-leads.json / TC-06)
+ * → vacant property → approve → contract → tenant → invoice → Razorpay payment.
+ * Skips GST/Razorpay org setup (assumes Flow1-NewOrganization + TC-06 already ran).
+ * Needs: org.json + crm-contacts-leads.json + Flow1-NewOrganization.
  * Saves: tenant-new-org.json
  *
  * Run:
- *   npx playwright test "tests/Direct Lead to Tenant Payment.spec.ts" --project=chromium --headed
+ *   npx playwright test "tests/Existing Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts" --headed
  */
-import { test, expect } from "@playwright/test";
+import { test, expect } from '../utils/test';
 import {
-  confirmCreateTenantUserAndCapturePassword,
+  ensureTenantUserOnContract,
   createTenantPasswordCapture,
   resolveTenantCredentials,
   startGmailCredentialPolling,
@@ -22,59 +19,15 @@ import {
 } from "../utils/TenantCredentials";
 import { saveSharedTenantDataNewOrg } from "../utils/SharedTenantData";
 import { loadSharedOrgData } from "../utils/SharedOrgData";
+import { loadSharedCrmData } from "../utils/SharedCrmData";
 import { fillInvoiceLineItemWithRentalIncome } from "../utils/InvoiceLineItem";
-import {
-  commitSequentialTenantIdentity,
-  fillIndiaPhoneInLeadForm,
-  peekNextSequentialTenantIdentity,
-} from "../utils/SharedTenantContactData";
+import { approveContractUntilActive, ensureMoveInRequest } from "../utils/ContractActions";
 
 function formatMoveInDate(date: Date = new Date()) {
   const day = String(date.getDate()).padStart(2, '0');
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const year = date.getFullYear();
   return `${year}-${month}-${day}`;
-}
-
-async function selectRandomFromCombobox(
-  page: import('@playwright/test').Page,
-  name: string,
-) {
-  await page.getByRole('combobox', { name }).click();
-
-  let options = page.getByRole('option');
-  if ((await options.count()) === 0) {
-    options = page.locator('[role="listbox"] [role="option"], [role="listbox"] button');
-  }
-
-  await options.first().waitFor({ state: 'visible', timeout: 10000 });
-  // Brief settle — list can re-render and detach option nodes
-  await page.waitForTimeout(300);
-  options = page.getByRole('option');
-  if ((await options.count()) === 0) {
-    options = page.locator('[role="listbox"] [role="option"], [role="listbox"] button');
-  }
-
-  const count = await options.count();
-  if (count === 0) {
-    throw new Error(`No options found for combobox: ${name}`);
-  }
-
-  const index = Math.floor(Math.random() * count);
-  const label = ((await options.nth(index).textContent()) || '').trim();
-  console.log(`${name} -> [${index + 1}/${count}] ${label}`);
-
-  // Prefer stable re-query by visible text (avoids detached DOM mid-click)
-  const byText = page.getByRole('option', { name: label, exact: true }).first();
-  if (await byText.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await byText.click({ force: true });
-  } else {
-    await options.nth(index).click({ force: true });
-  }
-
-  // Ensure list closed before next combobox
-  await page.keyboard.press('Escape').catch(() => undefined);
-  await page.waitForTimeout(200);
 }
 
 async function payViaRazorpayNetbanking(
@@ -109,11 +62,7 @@ async function payViaRazorpayNetbanking(
   // Netbanking panel — Suggested Banks or bank search list
   const netbankingReady = razorpayFrame.getByText(/Suggested Banks|Search for Banks|Bank of Baroda/i).first();
   if (!await netbankingReady.isVisible({ timeout: 5000 }).catch(() => false)) {
-    const netbankingFallback = razorpayFrame.locator('[data-testid="netbanking"], [data-value="netbanking"]').first()
-      .or(razorpayFrame.getByText('Netbanking', { exact: true }).first());
-    await netbankingFallback.click({ force: true }).catch(async () => {
-      await netbankingFallback.evaluate((el) => (el as HTMLElement).click());
-    });
+    await razorpayFrame.getByRole('radio', { name: /Netbanking/i }).click();
     await continuePaymentIfExitPrompt();
   }
   await netbankingReady.waitFor({ state: 'visible', timeout: 20000 });
@@ -284,62 +233,6 @@ async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabe
   await page.goto(url, { waitUntil: 'domcontentloaded' });
 }
 
-/** CRM → Leads page via sidebar (or direct URL). */
-async function goToCrmLeads(page: import('@playwright/test').Page) {
-  const leadsNav = page.getByRole('button', { name: /^Leads$/i })
-    .or(page.getByRole('link', { name: /^Leads$/i }))
-    .first();
-  if (await leadsNav.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await leadsNav.click();
-  } else {
-    await clickTopNavModule(page, 'CRM');
-    await page.getByRole('button', { name: /^Leads$/i })
-      .or(page.getByRole('link', { name: /^Leads$/i }))
-      .first()
-      .click({ timeout: 10000 })
-      .catch(async () => {
-        await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
-      });
-  }
-  await page.waitForURL(/\/crm\/leads/, { timeout: 30000 }).catch(() => undefined);
-  await page.getByRole('heading', { name: /Leads/i }).first().waitFor({ timeout: 30000 }).catch(() => undefined);
-}
-
-/**
- * After Create New Lead: confirm a Contact was auto-created with the same details.
- * Throws (terminates the test) if the contact is missing.
- */
-async function verifyAutoCreatedContact(
-  page: import('@playwright/test').Page,
-  data: { fullName: string; email: string; mobile: string },
-) {
-  await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
-  await page.getByRole('heading', { name: 'Contacts Management' }).waitFor({ timeout: 30000 });
-  await dismissEndToEndFlowTour(page);
-
-  const search = page.getByPlaceholder(/Search/i).first()
-    .or(page.getByRole('combobox', { name: /Search/i }).first());
-  if (await search.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await search.fill(data.email);
-    await page.waitForTimeout(1000);
-  }
-
-  const escapedName = data.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const nameRe = new RegExp(escapedName, 'i');
-  const contactByName = page.locator('h3').filter({ hasText: nameRe }).first();
-  const contactByEmail = page.getByText(data.email, { exact: false }).first();
-
-  const foundByName = await contactByName.isVisible({ timeout: 15000 }).catch(() => false);
-  const foundByEmail = await contactByEmail.isVisible({ timeout: 5000 }).catch(() => false);
-
-  if (!foundByName && !foundByEmail) {
-    throw new Error(
-      `Lead created but contact was NOT auto-created for ${data.fullName} (${data.email} / ${data.mobile}). Stopping flow.`,
-    );
-  }
-  console.log('Verified auto-created contact exists:', data.fullName, data.email, data.mobile);
-}
-
 /**
  * Deal property card: if rent is 0, set random rent (120000–600000), discount (10–30%),
  * select tax, Save → Mark as site visit → Submit for Approval.
@@ -490,40 +383,24 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
   }
 
   const approveDealBtn = page.getByRole('button', { name: /^Approve Deal$/i }).first();
-  let usedSubmitForApproval = false;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    if (await page.getByRole('button', { name: /Create Contract|View Contract/i }).first()
-      .isVisible({ timeout: 1500 }).catch(() => false)) {
-      return;
-    }
-
-    // Already initiated — Approve ready on Internal Approval
     const approveReady = page.getByRole('button', { name: /^Approve$/i }).first();
-    if (await approveReady.isVisible({ timeout: 2000 }).catch(() => false)
-      && !(await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 500 }).catch(() => false))) {
-      break;
-    }
+    if (await approveReady.isVisible({ timeout: 2000 }).catch(() => false)) break;
 
     const submitForApproval = page.getByRole('button', { name: /^Submit for Approval$/i }).first();
     if (await submitForApproval.isVisible({ timeout: 5000 }).catch(() => false)) {
       await closeWorkflowPreview(page);
       await submitForApproval.scrollIntoViewIfNeeded();
       await submitForApproval.click();
-      usedSubmitForApproval = true;
       console.log(`Clicked Submit for Approval (attempt ${attempt})`);
       await confirmSubmitDialog(page);
-      await page.getByText(/Deal property submitted successfully|IN PROGRESS|Approval In Progress|INITIATED/i)
+      await page.getByText(/Deal property submitted successfully|IN PROGRESS|Approval In Progress/i)
         .first()
-        .waitFor({ timeout: 15000 })
+        .waitFor({ timeout: 10000 })
         .catch(() => undefined);
-      await page.waitForTimeout(2000);
-      // If still NOT INITIATED, retry submit
-      if (await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 2000 }).catch(() => false)) {
-        console.log('Workflow still NOT INITIATED — will retry Submit for Approval');
-        continue;
-      }
-      break;
+      await page.waitForTimeout(1500);
+      continue;
     }
 
     if (await approveDealBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -537,40 +414,9 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
   await closeWorkflowPreview(page);
 
   const workflowSection = page.getByText(/Approval Workflow/i).first();
-  const workflowVisible = await workflowSection.isVisible({ timeout: 20000 }).catch(() => false);
-
-  // Simple Approve Deal only when no workflow UI and we did not go through Submit for Approval
-  if (!workflowVisible && !usedSubmitForApproval) {
-    const approveDealDialog = page.getByRole('dialog');
-    if (await approveDealDialog.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await approveDealDialog.getByRole('button', { name: /Approve|Confirm|Yes|Submit/i }).click();
-    }
-    await page.getByRole('button', { name: /Create Contract|View Contract/i }).first()
-      .waitFor({ state: 'visible', timeout: 60000 });
-    console.log('Deal approved without Approval Workflow (simple Approve Deal)');
-    return;
-  }
-
-  if (workflowVisible) {
-    await workflowSection.scrollIntoViewIfNeeded();
-  }
+  await workflowSection.waitFor({ state: 'visible', timeout: 30000 });
+  await workflowSection.scrollIntoViewIfNeeded();
   await page.getByText(/Loading workflow/i).waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
-
-  // If still not initiated, one more Submit attempt
-  if (await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 3000 }).catch(() => false)) {
-    const submitAgain = page.getByRole('button', { name: /^Submit for Approval$/i }).first();
-    if (await submitAgain.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await closeWorkflowPreview(page);
-      await submitAgain.click();
-      console.log('Re-clicked Submit for Approval (workflow was NOT INITIATED)');
-      await confirmSubmitDialog(page);
-      await page.waitForTimeout(2000);
-    }
-  }
-
-  await page.getByText(/NOT INITIATED/i).first()
-    .waitFor({ state: 'hidden', timeout: 30000 })
-    .catch(() => undefined);
 
   const internalApproval = page.locator('div, section, article')
     .filter({ hasText: /Internal Approval/i })
@@ -614,26 +460,29 @@ async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: 
   await page.waitForURL(/\/login/, { timeout: 15000 });
 }
 
-test('Direct Lead — auto contact through rent payment (new org)', async ({ page, context }) => {
-  const tenant = peekNextSequentialTenantIdentity();
-  const data = {
-    fullName: tenant.fullName,
-    email: tenant.email,
-    mobile: tenant.mobile,
-    propertyName: `villa${tenant.number}`,
-    tenantNumber: tenant.number,
-  };
+test('Existing Deal → Contract → Tenant → Invoice → Receive Payment', async ({ page, context }) => {
+  const propertyName = `villa${Date.now().toString().slice(-6)}`;
+  const data = { fullName: '', email: '', mobile: '', propertyName };
   const moveInDate = formatMoveInDate();
   const passwordCapture = createTenantPasswordCapture(page);
   let gmailCredentialsPromise: ReturnType<typeof startGmailCredentialPolling> | undefined;
   let tenantPassword: string | undefined;
   const admin = loadSharedOrgData();
-  console.log('Run data (new lead / auto contact):', data, 'Move-in date:', moveInDate);
-  console.log('Direct-lead→Payment admin login (from CreateOrganization org.json):', {
+  const crm = loadSharedCrmData();
+  if (!crm.leads.length) {
+    throw new Error('No leads in SharedCrmData — run Creating Contacts,Leads,Deals.spec.ts first (deals created from leads).');
+  }
+  const sharedDeal = crm.leads[Math.floor(Math.random() * crm.leads.length)];
+  data.fullName = sharedDeal.fullName;
+  data.email = sharedDeal.email;
+  data.mobile = sharedDeal.mobile;
+  console.log('Run data (existing deal from SharedCrmData lead):', data, 'Move-in date:', moveInDate);
+  console.log('Existing Deal→Payment admin login (from CreateOrganization org.json):', {
     orgId: admin.orgId,
     email: admin.email,
     orgName: admin.orgName,
   });
+  console.log('Picked shared CRM lead/deal:', sharedDeal);
 
   test.setTimeout(600_000);
   page.setDefaultTimeout(30_000);
@@ -649,117 +498,34 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
           await dismissNotificationsModal(page);
       }
       {
-          // CRM → Leads → Create New Lead (auto-creates Contact) — no Create Contact step
-          await clickTopNavModule(page, 'CRM');
-          await goToCrmLeads(page);
-          await dismissEndToEndFlowTour(page);
-
-          const createLeadBtn = page.getByRole('button', { name: /Create Lead|\+ Create Lead/i }).first();
-          await createLeadBtn.waitFor({ state: 'visible', timeout: 15000 });
-          await createLeadBtn.click();
-
-          const searchDialog = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
-          await searchDialog.waitFor({ state: 'visible', timeout: 15000 });
-
-          const searchBox = searchDialog
-            .getByPlaceholder(/Search by Name, Email or Phone/i)
-            .or(searchDialog.getByRole('textbox', { name: /Search by Name, Email or Phone/i }))
-            .first();
-          await searchBox.waitFor({ state: 'visible', timeout: 10000 });
-          await searchBox.fill(data.fullName);
-          console.log('Lead search typed:', data.fullName);
-
-          await searchDialog.getByText(/No matches found/i).waitFor({ state: 'visible', timeout: 15000 });
-          const createNewLeadOption = searchDialog.locator('div.cursor-pointer')
-            .filter({ hasText: /Create New Lead/i })
-            .filter({ hasText: /Start with/i });
-          await createNewLeadOption.waitFor({ state: 'visible', timeout: 10000 });
-          await createNewLeadOption.click();
-          console.log('Clicked Create New Lead option for search:', data.fullName);
-
-          await searchDialog.getByText(/No matches found/i).waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
-
-          const leadForm = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
-          await leadForm.waitFor({ state: 'visible', timeout: 15000 });
-
-          const nameField = leadForm.getByRole('textbox', { name: 'Full name' })
-            .or(leadForm.getByPlaceholder('Full name'))
-            .first();
-          await nameField.waitFor({ state: 'visible', timeout: 20000 });
-          await nameField.fill(data.fullName);
-
-          const emailField = leadForm.getByRole('textbox', { name: 'name@example.com' })
-            .or(leadForm.getByPlaceholder('name@example.com'))
-            .first();
-          await emailField.fill(data.email);
-
-          await fillIndiaPhoneInLeadForm(leadForm, data.mobile);
-
-          const nationality = leadForm.getByRole('combobox', { name: /e\.g\., UAE|nationality/i }).first();
-          if (await nationality.isVisible({ timeout: 3000 }).catch(() => false)) {
-            await nationality.click();
-            const natSearch = page.getByRole('textbox', { name: 'Search...' });
-            if (await natSearch.isVisible({ timeout: 2000 }).catch(() => false)) {
-              await natSearch.fill('indian');
-            }
-            const indian = page.getByRole('option', { name: 'Indian', exact: true });
-            if (await indian.isVisible({ timeout: 3000 }).catch(() => false)) {
-              await indian.click();
-            } else {
-              await page.keyboard.press('Escape').catch(() => undefined);
-            }
-          }
-
-          const scrollArea = leadForm.locator('div.overflow-y-auto, div[class*="overflow-y"]').last();
-          if (await scrollArea.count()) {
-            await scrollArea.evaluate((el) => { el.scrollTop = el.scrollHeight; });
-          } else {
-            await leadForm.evaluate((el) => { el.scrollTop = el.scrollHeight; }).catch(() => undefined);
-          }
-
-          const submitLeadBtn = leadForm.getByRole('button', { name: /^Create$/i }).last();
-          await submitLeadBtn.scrollIntoViewIfNeeded();
-          await expect(submitLeadBtn).toBeVisible();
-          await expect(submitLeadBtn).toBeEnabled();
-          await submitLeadBtn.click();
+          // CRM → Deals → open existing deal (created in TC-06 lead conversion)
+          const escapedName = sharedDeal.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const nameRe = new RegExp(escapedName, 'i');
 
           try {
-            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 20000 });
-          } catch {
-            await leadForm.press('End').catch(() => undefined);
-            await submitLeadBtn.click({ force: true });
-            await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
-          }
-          console.log('Lead created:', data.fullName, data.email, data.mobile);
-
-          const leadUrl = page.url();
-
-          // Must auto-create Contact with same details — stop if missing
-          await verifyAutoCreatedContact(page, data);
-
-          // Back to lead → Convert to Deal
-          await page.goto(leadUrl, { waitUntil: 'domcontentloaded' });
-          await page.getByRole('button', { name: 'Convert to Deal' }).waitFor({ timeout: 30000 });
-          await page.getByRole('button', { name: 'Convert to Deal' }).click();
-          const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
-          await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
-          await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
-          const paymentCombo = convertDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
-            .or(convertDialog.getByText(/Select payment type/i));
-          await paymentCombo.first().click();
-          await page.getByRole('option').first().click();
-          await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
-          await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
-
-          if (!page.url().includes('/crm/deals/')) {
-            await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
-            await page.locator('h4')
-              .filter({ hasText: new RegExp(`^${data.fullName}$`, 'i') })
+            await clickTopNavModule(page, 'CRM');
+            await page.getByRole('button', { name: /^Deals$/i })
+              .or(page.getByRole('link', { name: /^Deals$/i }))
               .first()
-              .click();
+              .click({ timeout: 10000 });
+          } catch {
+            await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
           }
+          await page.getByRole('heading', { name: /Deals/i }).first().waitFor({ timeout: 30000 });
+          await dismissEndToEndFlowTour(page);
+
+          const dealSearch = page.getByPlaceholder(/Search/i).first()
+            .or(page.getByRole('combobox', { name: /Search/i }).first());
+          if (await dealSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await dealSearch.fill(sharedDeal.fullName);
+            await page.waitForTimeout(1000);
+          }
+
+          const dealCard = page.locator('h3, h4, a').filter({ hasText: nameRe }).first();
+          await dealCard.waitFor({ state: 'visible', timeout: 30000 });
+          await dealCard.click();
           await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
-          console.log('On Deal Details — converted from direct lead');
+          console.log('Opened existing deal for:', sharedDeal.fullName);
       }
       {
 
@@ -830,21 +596,11 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
       }
       {
 
-          await page.getByRole('button', { name: 'Approve Contract' }).click();
-          const approveContractDialog = page.getByRole('dialog');
-          if (await approveContractDialog.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await approveContractDialog.getByRole('button', { name: /Approve|Confirm|Yes|Submit/i }).click();
-          }
-          await page.waitForURL(/\/accounts\/contracts\//, { timeout: 30000 }).catch(async () => {
-            await page.getByRole('button', { name: 'View Contract' }).click();
-            await page.waitForURL(/\/accounts\/contracts\//, { timeout: 30000 });
-          });
+          await approveContractUntilActive(page);
       }
       {
 
-          await page.getByRole('tab', { name: 'Action Buttons' }).click();
-          await page.getByRole('button', { name: /Create Tenant User/i }).click();
-          const dialogPassword = await confirmCreateTenantUserAndCapturePassword(page, passwordCapture);
+          const dialogPassword = await ensureTenantUserOnContract(page, passwordCapture);
           if (dialogPassword) {
             console.log('Tenant password captured for tenant user');
           }
@@ -854,28 +610,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
       }
       {
 
-          await page.getByRole('tab', { name: 'Action Buttons' }).click();
-          await page.getByRole('button', { name: /Create Move In Request/i }).click();
-          const moveInDialog = page.getByRole('dialog', { name: /Create Move-In Date/i });
-          await moveInDialog.waitFor({ state: 'visible', timeout: 10000 });
-          const dateField = moveInDialog.getByLabel('Tenant Move-in Date');
-          await dateField.click();
-          await dateField.fill('');
-          await dateField.fill(moveInDate);
-          await dateField.press('Tab').catch(() => undefined);
-          const confirmMoveIn = moveInDialog.getByRole('button', { name: /^Confirm$/i });
-          await expect(confirmMoveIn).toBeEnabled({ timeout: 10000 });
-          await confirmMoveIn.click();
-          // Dialog may stay open briefly or need a second confirm — don't hard-fail the whole flow
-          const closed = await moveInDialog.waitFor({ state: 'hidden', timeout: 20000 }).then(() => true).catch(() => false);
-          if (!closed) {
-            console.log('Move-in dialog still open — retrying Confirm / Escape');
-            await confirmMoveIn.click({ force: true }).catch(() => undefined);
-            await moveInDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(async () => {
-              await page.keyboard.press('Escape');
-              await moveInDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
-            });
-          }
+          await ensureMoveInRequest(page, moveInDate);
       }
       {
 
@@ -1104,9 +839,7 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
           await page.waitForURL(/\/tenant\/invoices\/\d+/, { timeout: 15000 });
 
           await page.getByRole('button', { name: /Pay Online/i }).click();
-          const payRazorpay = page.getByRole('button', { name: /Pay with Razorpay/i });
-          await expect(payRazorpay).toBeEnabled({ timeout: 60000 });
-          await payRazorpay.click();
+          await page.getByRole('button', { name: /Pay with Razorpay/i }).click();
 
           await payViaRazorpayNetbanking(page, context);
       }
@@ -1124,8 +857,6 @@ test('Direct Lead — auto contact through rent payment (new org)', async ({ pag
     orgId: admin.orgId,
     moveInDate,
   });
-
-  commitSequentialTenantIdentity(data.tenantNumber);
 
   passwordCapture.dispose();
 });

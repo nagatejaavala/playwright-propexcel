@@ -1,4 +1,5 @@
-import { test, expect, Page, Locator, BrowserContext } from '@playwright/test';
+import { test, expect } from '../utils/test';
+import type { Page, Locator, BrowserContext } from '@playwright/test';
 import { loadSharedTenantData } from '../utils/SharedTenantData';
 import { EXISTING_ORG_ADMIN } from '../utils/SharedOrgData';
 import { nextSharedCategory, SHARED_CATEGORIES } from '../utils/SharedCategory';
@@ -52,11 +53,35 @@ function dropdownOptionLocator(page: Page) {
   );
 }
 
+async function closeOpenDropdowns(page: Page) {
+  const propertySearch = page.getByPlaceholder(/Search properties/i);
+  if (await propertySearch.isVisible({ timeout: 500 }).catch(() => false)) {
+    await page.getByRole('heading', { name: /New Request/i }).click({ force: true });
+    await propertySearch.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
+  }
+
+  const expanded = page.getByRole('combobox', { expanded: true });
+  for (let i = 0; i < 3; i++) {
+    if (!(await expanded.first().isVisible({ timeout: 500 }).catch(() => false))) {
+      return;
+    }
+    await page.getByRole('heading', { name: /New Request/i }).click({ force: true }).catch(() => undefined);
+    await page.waitForTimeout(200);
+    if (!(await expanded.first().isVisible({ timeout: 500 }).catch(() => false))) {
+      return;
+    }
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(200);
+  }
+  await expanded.first().waitFor({ state: 'hidden', timeout: 3000 }).catch(() => undefined);
+}
+
 async function openCombobox(page: Page, combo: Locator) {
   await combo.waitFor({ state: 'visible', timeout: 10000 });
   await combo.scrollIntoViewIfNeeded();
+  await closeOpenDropdowns(page);
 
-  // Avoid the inner "Clear selection" button by clicking left side of the control
+  const options = dropdownOptionLocator(page);
   const box = await combo.boundingBox();
   if (box) {
     await page.mouse.click(box.x + Math.min(40, box.width / 4), box.y + box.height / 2);
@@ -64,17 +89,23 @@ async function openCombobox(page: Page, combo: Locator) {
     await combo.click({ force: true });
   }
 
-  const options = dropdownOptionLocator(page);
-  const opened = await options.first().waitFor({ state: 'visible', timeout: 3000 }).then(() => true).catch(() => false);
-  if (opened) return;
+  if (await options.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    return;
+  }
 
-  // Keyboard fallback (Radix / custom selects)
+  await combo.click({ force: true }).catch(() => undefined);
+  if (await options.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    return;
+  }
+
   await combo.focus().catch(() => undefined);
   await page.keyboard.press('ArrowDown');
-  await options.first().waitFor({ state: 'visible', timeout: 5000 }).catch(async () => {
-    await page.keyboard.press('Enter');
-    await options.first().waitFor({ state: 'visible', timeout: 5000 });
-  });
+  await page.waitForTimeout(300);
+  if (await options.first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    return;
+  }
+  await page.keyboard.press('Space');
+  await options.first().waitFor({ state: 'visible', timeout: 10000 });
 }
 
 async function pickFromOpenedList(
@@ -108,6 +139,7 @@ async function pickFromOpenedList(
         if (matcher.test(text)) {
           console.log(`${label} -> ${text}`);
           await options.nth(i).click();
+          await closeOpenDropdowns(page);
           return text;
         }
       }
@@ -130,6 +162,7 @@ async function pickFromOpenedList(
   const selected = allTexts[index];
   console.log(`${label} -> [${index + 1}/${count}] ${selected}`);
   await option.click();
+  await closeOpenDropdowns(page);
   return selected;
 }
 
@@ -141,7 +174,50 @@ async function comboboxForLabel(scope: Page | Locator, label: string): Promise<L
   }
 
   const labelEl = scope.getByText(labelPattern, { exact: true }).first();
+  for (const ancestor of ['xpath=..', 'xpath=../..']) {
+    const inField = labelEl.locator(ancestor).getByRole('combobox').first();
+    if (await inField.isVisible({ timeout: 1500 }).catch(() => false)) {
+      return inField;
+    }
+  }
+
   return labelEl.locator('xpath=following::*[@role="combobox"][1]');
+}
+
+async function taskDialogCombobox(taskDialog: Locator, label: string): Promise<Locator> {
+  // Prefer "Status *" / "Priority *" (form) over plain "Status" in Request Details
+  const requiredPattern = new RegExp(`^${escapeRegExp(label)}\\s*\\*$`, 'i');
+  const plainPattern = new RegExp(`^${escapeRegExp(label)}$`, 'i');
+
+  for (const pattern of [requiredPattern, plainPattern]) {
+    const labels = taskDialog.getByText(pattern);
+    const count = await labels.count();
+    for (let i = count - 1; i >= 0; i--) {
+      const labelEl = labels.nth(i);
+      if (!(await labelEl.isVisible({ timeout: 500 }).catch(() => false))) continue;
+      for (const ancestor of ['xpath=..', 'xpath=../..', 'xpath=../../..']) {
+        const combo = labelEl.locator(ancestor).getByRole('combobox').first();
+        if (await combo.isVisible({ timeout: 800 }).catch(() => false)) {
+          return combo;
+        }
+      }
+    }
+  }
+
+  if (/^status$/i.test(label)) {
+    const byValue = taskDialog.getByRole('combobox').filter({ hasText: /^(Open|Done|In Progress)$/i }).first();
+    if (await byValue.isVisible({ timeout: 2000 }).catch(() => false)) return byValue;
+  }
+  if (/^priority$/i.test(label)) {
+    const byValue = taskDialog.getByRole('combobox').filter({ hasText: /^(Low|Medium|High)$/i }).first();
+    if (await byValue.isVisible({ timeout: 2000 }).catch(() => false)) return byValue;
+  }
+  if (/assign to vendor/i.test(label)) {
+    const byValue = taskDialog.getByRole('combobox').filter({ hasText: /Not Assigned/i }).last();
+    if (await byValue.isVisible({ timeout: 2000 }).catch(() => false)) return byValue;
+  }
+
+  throw new Error(`Combobox not found for ${label} in Add Task dialog`);
 }
 
 async function selectFormDropdown(
@@ -153,6 +229,18 @@ async function selectFormDropdown(
 ): Promise<string> {
   const root = scope ?? page;
   const combo = await comboboxForLabel(root, labelText);
+  await combo.waitFor({ state: 'visible', timeout: 15000 });
+  const current = ((await combo.textContent()) || '').trim();
+  if (preferred) {
+    const matcher = new RegExp(`^${escapeRegExp(preferred)}$`, 'i');
+    if (matcher.test(current)) {
+      console.log(`${fieldName} already set -> ${current}`);
+      return current;
+    }
+  } else if (current && !/^(-{2,}|not selected|select)/i.test(current)) {
+    console.log(`${fieldName} already set -> ${current}`);
+    return current;
+  }
   await openCombobox(page, combo);
   return pickFromOpenedList(page, fieldName, preferred);
 }
@@ -163,17 +251,29 @@ async function resolveTaskCombobox(
   fieldName: string,
   index: number,
 ): Promise<Locator> {
-  const labels = [fieldName, fieldName.replace(/^Task /, '')];
+  const labels = [
+    fieldName,
+    fieldName.replace(/^Task /, ''),
+    fieldName.replace(/^Assign to /, ''),
+    'Assigned To',
+    'Assign to',
+    'Vendor',
+    'Status',
+    'Priority',
+  ];
+
+  for (const label of labels) {
+    const byLabel = await comboboxForLabel(taskDialog, label);
+    if (await byLabel.isVisible({ timeout: 1500 }).catch(() => false)) {
+      return byLabel;
+    }
+  }
+
   for (const label of labels) {
     const byRole = taskDialog.getByRole('combobox', { name: new RegExp(label, 'i') });
     if (await byRole.first().isVisible({ timeout: 1500 }).catch(() => false)) {
       return byRole.first();
     }
-  }
-
-  const filtered = taskDialog.getByRole('combobox').filter({ hasText: comboHint });
-  if (await filtered.first().isVisible({ timeout: 2000 }).catch(() => false)) {
-    return filtered.first();
   }
 
   const all = taskDialog.getByRole('combobox');
@@ -186,9 +286,11 @@ async function resolveTaskCombobox(
     }
   }
 
-  const byLabel = await comboboxForLabel(taskDialog, fieldName.replace(/^Task /, ''));
-  if (await byLabel.isVisible({ timeout: 2000 }).catch(() => false)) {
-    return byLabel;
+  if (!/assign to (vendor|employee)/i.test(fieldName)) {
+    const filtered = taskDialog.getByRole('combobox').filter({ hasText: comboHint });
+    if (await filtered.first().isVisible({ timeout: 2000 }).catch(() => false)) {
+      return filtered.first();
+    }
   }
 
   if (index < count) {
@@ -198,6 +300,77 @@ async function resolveTaskCombobox(
     return all.last();
   }
   throw new Error(`Combobox not found for ${fieldName}`);
+}
+
+async function closeTaskDropdownOnly(page: Page, taskDialog: Locator) {
+  const heading = taskDialog.getByRole('heading', { name: /Add Task/i });
+  if (await heading.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await heading.click({ force: true });
+    return;
+  }
+  await page.keyboard.press('Escape').catch(() => undefined);
+}
+
+async function selectTaskDialogFieldByLabel(
+  page: Page,
+  taskDialog: Locator,
+  label: string,
+  fieldName: string,
+  preferred?: string | RegExp,
+): Promise<string> {
+  const combo = await taskDialogCombobox(taskDialog, label);
+  await combo.waitFor({ state: 'visible', timeout: 15000 });
+  const current = ((await combo.textContent()) || '').trim();
+  if (preferred) {
+    const matcher = preferred instanceof RegExp
+      ? preferred
+      : new RegExp(`^${escapeRegExp(preferred)}$`, 'i');
+    if (matcher.test(current)) {
+      console.log(`${fieldName} already set -> ${current}`);
+      return current;
+    }
+  } else if (current && !/^(-{2,}|not assigned|select)/i.test(current)) {
+    console.log(`${fieldName} already set -> ${current}`);
+    return current;
+  }
+  await combo.scrollIntoViewIfNeeded();
+  await openCombobox(page, combo);
+  return pickFromOpenedList(page, fieldName, preferred);
+}
+
+async function assignVendorInTaskDialog(
+  page: Page,
+  taskDialog: Locator,
+  vendorName: string,
+): Promise<string> {
+  const vendorCombo = await taskDialogCombobox(taskDialog, 'Assign to Vendor');
+  await vendorCombo.scrollIntoViewIfNeeded();
+
+  const deadline = Date.now() + 60_000;
+  let lastError: Error | undefined;
+  while (Date.now() < deadline) {
+    try {
+      await openCombobox(page, vendorCombo);
+      const search = page.getByRole('textbox', { name: /Search/i }).last();
+      if (await search.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await search.fill('');
+        await search.fill(vendorName);
+        await page.waitForTimeout(1000);
+      }
+      return await pickFromOpenedList(
+        page,
+        'Assign to Vendor',
+        new RegExp(escapeRegExp(vendorName), 'i'),
+        /Super Admin/i,
+      );
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      console.log(`Assign to Vendor: retry — ${lastError.message}`);
+      await closeTaskDropdownOnly(page, taskDialog);
+      await page.waitForTimeout(2000);
+    }
+  }
+  throw lastError ?? new Error('Assign to Vendor: could not select vendor');
 }
 
 async function selectTaskDialogDropdown(
@@ -232,7 +405,7 @@ async function selectTaskDialogDropdown(
         throw lastError;
       }
       console.log(`${fieldName}: dropdown retry — ${lastError.message}`);
-      await page.keyboard.press('Escape').catch(() => undefined);
+      await closeTaskDropdownOnly(page, taskDialog);
       await page.waitForTimeout(2000);
     }
   }
@@ -242,8 +415,15 @@ async function selectTaskDialogDropdown(
 
 async function selectProperty(page: Page, propertyName: string): Promise<string> {
   const combo = page.getByRole('combobox', { name: /^Property$/i }).first();
+  const current = ((await combo.textContent()) || '').trim();
+  if (propertyName && new RegExp(escapeRegExp(propertyName), 'i').test(current)) {
+    console.log(`Property already set -> ${current}`);
+    return current;
+  }
   await openCombobox(page, combo);
-  return pickFromOpenedList(page, 'Property', propertyName || undefined);
+  const selected = await pickFromOpenedList(page, 'Property', propertyName || undefined);
+  await closeOpenDropdowns(page);
+  return selected;
 }
 
 async function logoutSuperAdmin(page: Page) {
@@ -642,6 +822,7 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
   }
 
   await fillRequestTitle();
+  await closeOpenDropdowns(page);
 
   const selectedCategory = await selectFormDropdown(page, 'Category', 'Category', sharedCategory);
   const selectedPriority = await selectFormDropdown(page, 'Priority', 'Priority');
@@ -739,26 +920,22 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
   await page.getByRole('button', { name: /Add task/i }).waitFor({ state: 'visible', timeout: 30000 });
 
   // 11) Add task
+  const existingTaskOnRequest = page.getByText(new RegExp(`^${escapeRegExp(taskTitle)}$`, 'i')).first();
+  if (await existingTaskOnRequest.isVisible({ timeout: 5000 }).catch(() => false)) {
+    console.log('Task already exists on request — skipping Add Task dialog');
+  } else {
   await page.getByRole('button', { name: /Add task/i }).click();
 
   const taskDialog = page.getByRole('dialog', { name: /Add Task/i });
   await taskDialog.getByRole('heading', { name: /Add Task/i }).waitFor({ timeout: 15000 });
-  await taskDialog.getByRole('combobox').first().waitFor({ state: 'visible', timeout: 30000 });
+  await taskDialog.getByText(/^Status\s*\*$/i).waitFor({ state: 'visible', timeout: 30000 });
+  await taskDialog.getByRole('textbox', { name: /Title/i }).waitFor({ state: 'visible', timeout: 15000 });
 
   await taskDialog.getByRole('textbox', { name: /Title/i }).fill(taskTitle);
 
-  const taskStatus = await selectTaskDialogDropdown(page, taskDialog, /Select status|Open/i, 'Task Status', 'Open', undefined, 0);
-  const taskPriority = await selectTaskDialogDropdown(page, taskDialog, /Low|Medium|High|Critical/i, 'Task Priority', undefined, undefined, 1);
-  const assignedVendor = await selectTaskDialogDropdown(
-    page,
-    taskDialog,
-    /Not Assigned|Select vendor/i,
-    'Assign to Vendor',
-    new RegExp(escapeRegExp(vendor.name), 'i'),
-    vendor.name,
-    2,
-    /Super Admin/i,
-  );
+  const taskStatus = await selectTaskDialogFieldByLabel(page, taskDialog, 'Status', 'Task Status', 'Open');
+  const taskPriority = await selectTaskDialogFieldByLabel(page, taskDialog, 'Priority', 'Task Priority');
+  const assignedVendor = await assignVendorInTaskDialog(page, taskDialog, vendor.name);
 
   // 12) Save Task
   await taskDialog.getByRole('button', { name: /^Save Task$/i }).click();
@@ -770,6 +947,7 @@ test('Propexcel Flow 2 — tenant request, vendor, and operations task', async (
     priority: taskPriority,
     vendor: assignedVendor,
   });
+  }
 
   // 13) Left sidebar → Tasks
   await page.getByRole('button', { name: /^Tasks$/i }).click();

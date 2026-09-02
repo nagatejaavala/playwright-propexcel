@@ -1,17 +1,19 @@
 /**
- * Skip Lead Flow → Tenant Payment
- * Login (org.json) → CRM Deals → Create Deal (existing contact from crm-contacts-leads.json)
- * → vacant property → approve → contract → tenant → rent pay.
- * Skips Create Lead / Convert to Deal. Does not modify ExistingContact-ToTenantPayment.spec.ts.
- * Needs: org.json + crm-contacts-leads.json.
+ * New Lead Creation (Auto-creates Contact) → Deal → Contract → Tenant → Invoice → Receive Payment
+ * Login (org.json) → CRM Leads → Create New Lead (auto-creates Contact)
+ * → verify contact exists (stop if not) → Convert to Deal → vacant property
+ * → approve → contract → tenant → invoice → Razorpay payment.
+ * Does NOT configure Razorpay / GST / Deal Approve / Create Property / Create Contact
+ * (assumes org already set up, e.g. after CreateOrg + Flow1).
+ * Needs: org.json (+ vacant units, Razorpay, GST already on org).
  * Saves: tenant-new-org.json
  *
  * Run:
- *   npx playwright test "tests/Skip lead flow - tenenat Payment.spec.ts" --project=chromium --headed
+ *   npx playwright test "tests/New Lead Creation (Auto-creates Contact) → Deal → Contract → Tenant → Invoice → Receive Payment.spec.ts" --headed
  */
-import { test, expect } from "@playwright/test";
+import { test, expect } from '../utils/test';
 import {
-  confirmCreateTenantUserAndCapturePassword,
+  ensureTenantUserOnContract,
   createTenantPasswordCapture,
   resolveTenantCredentials,
   startGmailCredentialPolling,
@@ -19,8 +21,13 @@ import {
 } from "../utils/TenantCredentials";
 import { saveSharedTenantDataNewOrg } from "../utils/SharedTenantData";
 import { loadSharedOrgData } from "../utils/SharedOrgData";
-import { loadSharedCrmData } from "../utils/SharedCrmData";
 import { fillInvoiceLineItemWithRentalIncome } from "../utils/InvoiceLineItem";
+import { approveContractUntilActive, ensureMoveInRequest } from "../utils/ContractActions";
+import {
+  commitSequentialTenantIdentity,
+  fillIndiaPhoneInLeadForm,
+  peekNextSequentialTenantIdentity,
+} from "../utils/SharedTenantContactData";
 
 function formatMoveInDate(date: Date = new Date()) {
   const day = String(date.getDate()).padStart(2, '0');
@@ -102,7 +109,11 @@ async function payViaRazorpayNetbanking(
   // Netbanking panel — Suggested Banks or bank search list
   const netbankingReady = razorpayFrame.getByText(/Suggested Banks|Search for Banks|Bank of Baroda/i).first();
   if (!await netbankingReady.isVisible({ timeout: 5000 }).catch(() => false)) {
-    await razorpayFrame.getByRole('radio', { name: /Netbanking/i }).click();
+    const netbankingFallback = razorpayFrame.locator('[data-testid="netbanking"], [data-value="netbanking"]').first()
+      .or(razorpayFrame.getByText('Netbanking', { exact: true }).first());
+    await netbankingFallback.click({ force: true }).catch(async () => {
+      await netbankingFallback.evaluate((el) => (el as HTMLElement).click());
+    });
     await continuePaymentIfExitPrompt();
   }
   await netbankingReady.waitFor({ state: 'visible', timeout: 20000 });
@@ -273,163 +284,60 @@ async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabe
   await page.goto(url, { waitUntil: 'domcontentloaded' });
 }
 
-/** Configure Razorpay under Admin → Integrations (needed when Flow1 was not run). */
-async function configureRazorpayIntegration(page: import('@playwright/test').Page) {
-  await dismissEndToEndFlowTour(page);
-  await dismissNotificationsModal(page);
-
-  try {
-    await clickTopNavModule(page, 'Admin');
-  } catch {
-    await clickTopNavModule(page, 'Settings').catch(() => undefined);
-  }
-  await dismissEndToEndFlowTour(page);
-  await dismissNotificationsModal(page);
-
-  await page.getByRole('button', { name: /^Employees$/i })
-    .or(page.getByRole('button', { name: /^Integrations$/i }))
-    .or(page.getByText(/^Admin$/i))
-    .first()
-    .waitFor({ state: 'visible', timeout: 15000 })
-    .catch(() => undefined);
-
-  const integrationsNav = page.getByRole('button', { name: /^Integrations$/i })
-    .or(page.getByRole('link', { name: /^Integrations$/i }))
+/** CRM → Leads page via sidebar (or direct URL). */
+async function goToCrmLeads(page: import('@playwright/test').Page) {
+  const leadsNav = page.getByRole('button', { name: /^Leads$/i })
+    .or(page.getByRole('link', { name: /^Leads$/i }))
     .first();
-  if (await integrationsNav.isVisible({ timeout: 8000 }).catch(() => false)) {
-    await integrationsNav.click({ timeout: 20000 });
+  if (await leadsNav.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await leadsNav.click();
   } else {
-    await page.goto('https://test.propexcel.com/admin/integrations', { waitUntil: 'domcontentloaded' });
+    await clickTopNavModule(page, 'CRM');
+    await page.getByRole('button', { name: /^Leads$/i })
+      .or(page.getByRole('link', { name: /^Leads$/i }))
+      .first()
+      .click({ timeout: 10000 })
+      .catch(async () => {
+        await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
+      });
   }
-
-  await page.getByRole('link', { name: /^Razorpay$/i })
-    .or(page.getByRole('button', { name: /^Razorpay$/i }))
-    .or(page.getByRole('tab', { name: /^Razorpay$/i }))
-    .or(page.getByText(/^Razorpay$/i))
-    .first()
-    .click();
-
-  const keyId = page.getByLabel(/Razorpay\s*Key\s*ID/i)
-    .or(page.getByRole('textbox', { name: /Razorpay\s*Key\s*ID/i }))
-    .or(page.getByPlaceholder(/Key ID|rzp_/i))
-    .first();
-  const keySecret = page.getByLabel(/Razorpay\s*Key\s*Secret/i)
-    .or(page.getByRole('textbox', { name: /Razorpay\s*Key\s*Secret/i }))
-    .or(page.getByPlaceholder(/Key Secret|secret/i))
-    .first();
-
-  await keyId.waitFor({ state: 'visible', timeout: 15000 });
-  await keyId.fill('');
-  await keyId.fill('rzp_test_Strt5pbr1bvoIR');
-  await keySecret.fill('');
-  await keySecret.fill('TOOPnInaNRdn7Sn1FuXnNVTz');
-
-  await page.getByRole('button', { name: /Save Settings/i }).click();
-  await page.getByText(/saved|success|updated/i).first().waitFor({ timeout: 10000 }).catch(() => undefined);
-  console.log('Razorpay integration settings saved');
+  await page.waitForURL(/\/crm\/leads/, { timeout: 30000 }).catch(() => undefined);
+  await page.getByRole('heading', { name: /Leads/i }).first().waitFor({ timeout: 30000 }).catch(() => undefined);
 }
 
 /**
- * Accounts → Account Settings → Taxes → configure GST 18%
- * (New orgs default to 5%; deal/property tax dropdown needs GST 18%.)
+ * After Create New Lead: confirm a Contact was auto-created with the same details.
+ * Throws (terminates the test) if the contact is missing.
  */
-async function configureTaxSettings(page: import('@playwright/test').Page) {
+async function verifyAutoCreatedContact(
+  page: import('@playwright/test').Page,
+  data: { fullName: string; email: string; mobile: string },
+) {
+  await page.goto('https://test.propexcel.com/crm/contacts', { waitUntil: 'domcontentloaded' });
+  await page.getByRole('heading', { name: 'Contacts Management' }).waitFor({ timeout: 30000 });
   await dismissEndToEndFlowTour(page);
-  await dismissNotificationsModal(page);
 
-  await clickTopNavModule(page, 'Accounts');
-  await dismissEndToEndFlowTour(page);
-
-  const accountSettings = page.getByRole('button', { name: /^Account Settings$/i })
-    .or(page.getByRole('link', { name: /^Account Settings$/i }))
-    .first();
-  if (await accountSettings.isVisible({ timeout: 8000 }).catch(() => false)) {
-    await accountSettings.click();
-    await page.getByRole('heading', { name: /Accounts? Settings/i }).waitFor({ timeout: 20000 });
-
-    const taxesCard = page.locator('div')
-      .filter({ hasText: /Taxes/i })
-      .filter({ hasText: /Configure tax rates|tax settings/i })
-      .first();
-    if (await taxesCard.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await taxesCard.getByRole('button', { name: /Manage/i }).first().click();
-    } else {
-      await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
-    }
-  } else {
-    await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
-  }
-
-  await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
-  await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 });
-  await page.waitForTimeout(1000);
-
-  if (await page.getByText(/GST\s*\(\s*18\s*%\s*\)|GST-18/i).first().isVisible({ timeout: 8000 }).catch(() => false)) {
-    console.log('GST (18%) already configured — skipping tax create');
-    return;
-  }
-
-  const vatRow = page.getByRole('row').filter({ hasText: /\bVAT\b/i }).first();
-  if (await vatRow.isVisible({ timeout: 5000 }).catch(() => false)) {
-    const deleteBtn = vatRow.getByRole('button', { name: /Delete/i })
-      .or(vatRow.locator('button[aria-label*="Delete" i]'))
-      .or(vatRow.locator('button').last());
-    await deleteBtn.click({ force: true });
-    const confirmDelete = page.getByRole('dialog').getByRole('button', { name: /Delete|Confirm|Yes/i }).first();
-    if (await confirmDelete.isVisible({ timeout: 4000 }).catch(() => false)) {
-      await confirmDelete.click();
-    }
-    await vatRow.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
-    console.log('Deleted existing VAT tax');
-    await page.goto('https://test.propexcel.com/accounts/taxes', { waitUntil: 'domcontentloaded' });
-    await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 });
+  const search = page.getByPlaceholder(/Search/i).first()
+    .or(page.getByRole('combobox', { name: /Search/i }).first());
+  if (await search.isVisible({ timeout: 5000 }).catch(() => false)) {
+    await search.fill(data.email);
     await page.waitForTimeout(1000);
   }
 
-  if (await page.getByText(/GST\s*\(\s*18\s*%\s*\)|GST-18/i).first().isVisible({ timeout: 5000 }).catch(() => false)) {
-    console.log('GST (18%) already configured — skipping tax create');
-    return;
+  const escapedName = data.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const nameRe = new RegExp(escapedName, 'i');
+  const contactByName = page.locator('h3').filter({ hasText: nameRe }).first();
+  const contactByEmail = page.getByText(data.email, { exact: false }).first();
+
+  const foundByName = await contactByName.isVisible({ timeout: 15000 }).catch(() => false);
+  const foundByEmail = await contactByEmail.isVisible({ timeout: 5000 }).catch(() => false);
+
+  if (!foundByName && !foundByEmail) {
+    throw new Error(
+      `Lead created but contact was NOT auto-created for ${data.fullName} (${data.email} / ${data.mobile}). Stopping flow.`,
+    );
   }
-
-  await dismissEndToEndFlowTour(page);
-  await dismissNotificationsModal(page);
-
-  const createTaxBtn = page.getByRole('button', { name: /\+?\s*Create New Tax/i })
-    .or(page.getByRole('button', { name: /Create Tax|Add Tax|New Tax/i }))
-    .first();
-  await createTaxBtn.waitFor({ state: 'visible', timeout: 20000 });
-  await createTaxBtn.click({ force: true }).catch(async () => {
-    await createTaxBtn.evaluate((el) => (el as HTMLElement).click());
-  });
-  console.log('Creating new tax GST (18%)');
-
-  await page.getByRole('heading', { name: /Edit Tax|Create New Tax|Create.*Tax|New Tax|Tax Information/i })
-    .first()
-    .waitFor({ timeout: 20000 });
-
-  const taxName = page.getByRole('textbox', { name: /e\.g\., TAX, Service Tax|Tax Name/i })
-    .or(page.getByPlaceholder(/TAX, Service Tax|Tax Name/i))
-    .first();
-  const taxCode = page.getByRole('textbox', { name: /e\.g\., TAX-001|Tax Code/i })
-    .or(page.getByPlaceholder(/TAX-001|Tax Code/i))
-    .first();
-  const taxPct = page.getByRole('spinbutton', { name: /e\.g\., 5\.00|Tax Percentage/i })
-    .or(page.getByPlaceholder(/5\.00|Tax Percentage/i))
-    .or(page.locator('input[type="number"]').first())
-    .first();
-
-  await taxName.waitFor({ state: 'visible', timeout: 15000 });
-  await taxName.fill('');
-  await taxName.fill('GST (18%)');
-  await taxCode.fill('');
-  await taxCode.fill('GST-18');
-  await taxPct.fill('');
-  await taxPct.fill('18');
-
-  await page.getByRole('button', { name: /Create Tax/i }).first().click();
-  await page.getByRole('heading', { name: /^Taxes$/i }).waitFor({ timeout: 30000 }).catch(() => undefined);
-  await page.getByText(/GST \(18%\)|GST-18|18\.00%/i).first().waitFor({ timeout: 15000 }).catch(() => undefined);
-  console.log('Tax settings saved: GST (18%) / GST-18 / 18%');
+  console.log('Verified auto-created contact exists:', data.fullName, data.email, data.mobile);
 }
 
 /**
@@ -582,24 +490,40 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
   }
 
   const approveDealBtn = page.getByRole('button', { name: /^Approve Deal$/i }).first();
+  let usedSubmitForApproval = false;
 
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (await page.getByRole('button', { name: /Create Contract|View Contract/i }).first()
+      .isVisible({ timeout: 1500 }).catch(() => false)) {
+      return;
+    }
+
+    // Already initiated — Approve ready on Internal Approval
     const approveReady = page.getByRole('button', { name: /^Approve$/i }).first();
-    if (await approveReady.isVisible({ timeout: 2000 }).catch(() => false)) break;
+    if (await approveReady.isVisible({ timeout: 2000 }).catch(() => false)
+      && !(await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 500 }).catch(() => false))) {
+      break;
+    }
 
     const submitForApproval = page.getByRole('button', { name: /^Submit for Approval$/i }).first();
     if (await submitForApproval.isVisible({ timeout: 5000 }).catch(() => false)) {
       await closeWorkflowPreview(page);
       await submitForApproval.scrollIntoViewIfNeeded();
       await submitForApproval.click();
+      usedSubmitForApproval = true;
       console.log(`Clicked Submit for Approval (attempt ${attempt})`);
       await confirmSubmitDialog(page);
-      await page.getByText(/Deal property submitted successfully|IN PROGRESS|Approval In Progress/i)
+      await page.getByText(/Deal property submitted successfully|IN PROGRESS|Approval In Progress|INITIATED/i)
         .first()
-        .waitFor({ timeout: 10000 })
+        .waitFor({ timeout: 15000 })
         .catch(() => undefined);
-      await page.waitForTimeout(1500);
-      continue;
+      await page.waitForTimeout(2000);
+      // If still NOT INITIATED, retry submit
+      if (await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 2000 }).catch(() => false)) {
+        console.log('Workflow still NOT INITIATED — will retry Submit for Approval');
+        continue;
+      }
+      break;
     }
 
     if (await approveDealBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
@@ -612,9 +536,11 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
 
   await closeWorkflowPreview(page);
 
-  // Deal Approve workflow (Flow1) — if missing, simple Approve Deal is enough
   const workflowSection = page.getByText(/Approval Workflow/i).first();
-  if (!(await workflowSection.isVisible({ timeout: 8000 }).catch(() => false))) {
+  const workflowVisible = await workflowSection.isVisible({ timeout: 20000 }).catch(() => false);
+
+  // Simple Approve Deal only when no workflow UI and we did not go through Submit for Approval
+  if (!workflowVisible && !usedSubmitForApproval) {
     const approveDealDialog = page.getByRole('dialog');
     if (await approveDealDialog.isVisible({ timeout: 3000 }).catch(() => false)) {
       await approveDealDialog.getByRole('button', { name: /Approve|Confirm|Yes|Submit/i }).click();
@@ -625,8 +551,26 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
     return;
   }
 
-  await workflowSection.scrollIntoViewIfNeeded();
+  if (workflowVisible) {
+    await workflowSection.scrollIntoViewIfNeeded();
+  }
   await page.getByText(/Loading workflow/i).waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
+
+  // If still not initiated, one more Submit attempt
+  if (await page.getByText(/NOT INITIATED/i).first().isVisible({ timeout: 3000 }).catch(() => false)) {
+    const submitAgain = page.getByRole('button', { name: /^Submit for Approval$/i }).first();
+    if (await submitAgain.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await closeWorkflowPreview(page);
+      await submitAgain.click();
+      console.log('Re-clicked Submit for Approval (workflow was NOT INITIATED)');
+      await confirmSubmitDialog(page);
+      await page.waitForTimeout(2000);
+    }
+  }
+
+  await page.getByText(/NOT INITIATED/i).first()
+    .waitFor({ state: 'hidden', timeout: 30000 })
+    .catch(() => undefined);
 
   const internalApproval = page.locator('div, section, article')
     .filter({ hasText: /Internal Approval/i })
@@ -670,29 +614,26 @@ async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: 
   await page.waitForURL(/\/login/, { timeout: 15000 });
 }
 
-test('Skip lead — existing contact Create Deal through rent payment (new org)', async ({ page, context }) => {
-  const propertyName = `villa${Date.now().toString().slice(-6)}`;
-  const data = { fullName: '', email: '', mobile: '', propertyName };
+test('New Lead Creation (Auto-creates Contact) → Deal → Contract → Tenant → Invoice → Receive Payment', async ({ page, context }) => {
+  const tenant = peekNextSequentialTenantIdentity();
+  const data = {
+    fullName: tenant.fullName,
+    email: tenant.email,
+    mobile: tenant.mobile,
+    propertyName: `villa${tenant.number}`,
+    tenantNumber: tenant.number,
+  };
   const moveInDate = formatMoveInDate();
   const passwordCapture = createTenantPasswordCapture(page);
   let gmailCredentialsPromise: ReturnType<typeof startGmailCredentialPolling> | undefined;
   let tenantPassword: string | undefined;
   const admin = loadSharedOrgData();
-  const crm = loadSharedCrmData();
-  if (!crm.contacts.length) {
-    throw new Error('No contacts in SharedCrmData — run Creating Contacts,Leads,Deals.spec.ts first.');
-  }
-  const sharedContact = crm.contacts[Math.floor(Math.random() * crm.contacts.length)];
-  data.fullName = sharedContact.fullName;
-  data.email = sharedContact.email;
-  data.mobile = sharedContact.mobile;
-  console.log('Run data (from SharedCrmData contact):', data, 'Move-in date:', moveInDate);
-  console.log('Skip-lead→Payment admin login (from CreateOrganization org.json):', {
+  console.log('Run data (new lead / auto contact):', data, 'Move-in date:', moveInDate);
+  console.log('Direct-lead→Payment admin login (from CreateOrganization org.json):', {
     orgId: admin.orgId,
     email: admin.email,
     orgName: admin.orgName,
   });
-  console.log('Picked shared CRM contact for Create Deal:', sharedContact);
 
   test.setTimeout(600_000);
   page.setDefaultTimeout(30_000);
@@ -706,95 +647,201 @@ test('Skip lead — existing contact Create Deal through rent payment (new org)'
           await page.waitForURL((url) => !url.pathname.includes('/login'), { timeout: 60000 });
           await dismissEndToEndFlowTour(page);
           await dismissNotificationsModal(page);
-          await page.getByRole('heading', { name: 'Properties', level: 1 }).waitFor({ timeout: 60000 }).catch(() => undefined);
-          await configureRazorpayIntegration(page);
-          await configureTaxSettings(page);
       }
       {
-          // CRM → Deals (sidebar) → Create Deal with existing shared contact (skip lead)
-          const escapedName = sharedContact.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-          const nameRe = new RegExp(escapedName, 'i');
-
-          try {
-            await clickTopNavModule(page, 'CRM');
-            await page.getByRole('button', { name: /^Deals$/i })
-              .or(page.getByRole('link', { name: /^Deals$/i }))
-              .first()
-              .click({ timeout: 10000 });
-          } catch {
-            await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
-          }
-          await page.getByRole('heading', { name: /Deals/i }).first().waitFor({ timeout: 30000 });
+          // CRM → Leads → Create New Lead (auto-creates Contact) — no Create Contact step
+          await clickTopNavModule(page, 'CRM');
+          await goToCrmLeads(page);
           await dismissEndToEndFlowTour(page);
 
-          const createDealBtn = page.getByRole('button', { name: /Create Deal|\+?\s*Create Deal|New Deal|\+?\s*New Deal/i }).first();
-          await createDealBtn.waitFor({ state: 'visible', timeout: 15000 });
-          await createDealBtn.click();
-          console.log('Opened Create Deal (skip lead)');
+          const createLeadBtn = page.getByRole('button', { name: /Create Lead|\+ Create Lead/i }).first();
+          await createLeadBtn.waitFor({ state: 'visible', timeout: 15000 });
+          await createLeadBtn.click();
 
-          const dealDialog = page.getByRole('dialog').filter({ hasText: /Create (New )?Deal|New Deal/i }).first();
-          await dealDialog.waitFor({ state: 'visible', timeout: 15000 });
+          const searchDialog = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
+          await searchDialog.waitFor({ state: 'visible', timeout: 15000 });
 
-          const searchBox = dealDialog
-            .getByPlaceholder(/Search by Name, Email or Phone|Search and select|Search/i)
-            .or(dealDialog.getByRole('textbox', { name: /Search/i }))
-            .or(dealDialog.getByRole('combobox', { name: /Search|Contact|Select contact/i }))
+          const searchBox = searchDialog
+            .getByPlaceholder(/Search by Name, Email or Phone/i)
+            .or(searchDialog.getByRole('textbox', { name: /Search by Name, Email or Phone/i }))
             .first();
-          await searchBox.waitFor({ state: 'visible', timeout: 15000 });
-          await searchBox.click();
-          await searchBox.fill(sharedContact.fullName);
-          await page.waitForTimeout(800);
+          await searchBox.waitFor({ state: 'visible', timeout: 10000 });
+          await searchBox.fill(data.fullName);
+          console.log('Lead search typed:', data.fullName);
+          await page.waitForTimeout(1200);
 
-          const contactMatch = dealDialog
-            .getByRole('option', { name: nameRe })
-            .or(page.getByRole('option', { name: nameRe }))
-            .or(dealDialog.locator('div.cursor-pointer, [role="option"], li').filter({ hasText: nameRe }))
-            .or(page.locator('div.cursor-pointer, [role="option"]').filter({ hasText: nameRe }))
+          const createNewLeadOption = searchDialog.locator('div.cursor-pointer')
+            .filter({ hasText: /Create New Lead/i })
+            .filter({ hasText: /Start with/i });
+          const noMatches = searchDialog.getByText(/No matches found/i);
+          const nameRe = new RegExp(data.fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+          const existingMatch = searchDialog
+            .locator('.cursor-pointer, [cursor="pointer"]')
+            .filter({ hasText: nameRe })
+            .filter({ hasNotText: /Create New Lead/i })
             .first();
-          await contactMatch.waitFor({ state: 'visible', timeout: 15000 });
-          await contactMatch.click();
-          console.log('Selected existing contact for deal:', sharedContact.fullName);
 
-          const paymentCombo = dealDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
-            .or(dealDialog.getByRole('combobox').filter({ hasText: /payment|Select/i }))
-            .first();
-          if (await paymentCombo.isVisible({ timeout: 8000 }).catch(() => false)) {
-            await paymentCombo.click();
-            await page.getByRole('option').first().waitFor({ state: 'visible', timeout: 10000 });
-            await page.getByRole('option').first().click();
-            console.log('Selected payment type for Create Deal');
+          let reusedExistingLead = false;
+          // Prefer an existing match over "Create New Lead" (UI often shows both).
+          if (await existingMatch.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await existingMatch.click();
+            reusedExistingLead = true;
+            console.log('Existing lead/contact found — reusing:', data.fullName);
+            await page.waitForURL(/\/crm\/(leads|contacts|deals)\//, { timeout: 30000 }).catch(() => undefined);
+          } else if (await createNewLeadOption.isVisible({ timeout: 4000 }).catch(() => false)) {
+            await createNewLeadOption.click();
+            console.log('Clicked Create New Lead option for search:', data.fullName);
+          } else if (await noMatches.isVisible({ timeout: 3000 }).catch(() => false)) {
+            await createNewLeadOption.waitFor({ state: 'visible', timeout: 10000 });
+            await createNewLeadOption.click();
+            console.log('Clicked Create New Lead option for search:', data.fullName);
+          } else {
+            await noMatches.waitFor({ state: 'visible', timeout: 10000 });
+            await createNewLeadOption.waitFor({ state: 'visible', timeout: 10000 });
+            await createNewLeadOption.click();
+            console.log('Clicked Create New Lead option for search:', data.fullName);
           }
 
-          const submitDeal = dealDialog
-            .getByRole('button', { name: /Create Deal|^Create$|^Save$|^Submit$/i })
-            .last();
-          await submitDeal.scrollIntoViewIfNeeded();
-          await expect(submitDeal).toBeEnabled({ timeout: 15000 });
-          await submitDeal.click();
+          if (!reusedExistingLead) {
+            await searchDialog.getByText(/No matches found/i).waitFor({ state: 'hidden', timeout: 15000 }).catch(() => undefined);
 
-          const alreadyExists = page.getByText(/already exists|deal already|duplicate/i).first();
-          try {
-            await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
-          } catch {
-            if (await alreadyExists.isVisible({ timeout: 3000 }).catch(() => false)) {
-              console.log('Create Deal blocked — opening existing deal for contact');
-              await page.keyboard.press('Escape').catch(() => undefined);
-              await dealDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
-              await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
-              const dealSearch = page.getByPlaceholder(/Search/i).first()
-                .or(page.getByRole('combobox', { name: /Search/i }).first());
-              if (await dealSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
-                await dealSearch.fill(sharedContact.fullName);
-                await page.waitForTimeout(1000);
+            const leadForm = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
+            await leadForm.waitFor({ state: 'visible', timeout: 15000 });
+
+            const nameField = leadForm.getByRole('textbox', { name: 'Full name' })
+              .or(leadForm.getByPlaceholder('Full name'))
+              .first();
+            await nameField.waitFor({ state: 'visible', timeout: 20000 });
+            await nameField.fill(data.fullName);
+
+            const emailField = leadForm.getByRole('textbox', { name: 'name@example.com' })
+              .or(leadForm.getByPlaceholder('name@example.com'))
+              .first();
+            await emailField.fill(data.email);
+
+            await fillIndiaPhoneInLeadForm(leadForm, data.mobile);
+
+            const nationality = leadForm.getByRole('combobox', { name: /e\.g\., UAE|nationality/i }).first();
+            if (await nationality.isVisible({ timeout: 3000 }).catch(() => false)) {
+              await nationality.click();
+              const natSearch = page.getByRole('textbox', { name: 'Search...' });
+              if (await natSearch.isVisible({ timeout: 2000 }).catch(() => false)) {
+                await natSearch.fill('indian');
               }
-              await page.locator('h3, h4, a').filter({ hasText: nameRe }).first().click();
-              await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
+              const indian = page.getByRole('option', { name: 'Indian', exact: true });
+              if (await indian.isVisible({ timeout: 3000 }).catch(() => false)) {
+                await indian.click();
+              } else {
+                await page.keyboard.press('Escape').catch(() => undefined);
+              }
+            }
+
+            const scrollArea = leadForm.locator('div.overflow-y-auto, div[class*="overflow-y"]').last();
+            if (await scrollArea.count()) {
+              await scrollArea.evaluate((el) => { el.scrollTop = el.scrollHeight; });
             } else {
-              await page.waitForURL(/\/crm\/deals\/(?!create)/, { timeout: 30000 });
-              await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
+              await leadForm.evaluate((el) => { el.scrollTop = el.scrollHeight; }).catch(() => undefined);
+            }
+
+            const submitLeadBtn = leadForm.getByRole('button', { name: /^Create$/i }).last();
+            await submitLeadBtn.scrollIntoViewIfNeeded();
+            await expect(submitLeadBtn).toBeVisible();
+            await expect(submitLeadBtn).toBeEnabled();
+            await submitLeadBtn.click();
+
+            const alreadyExists = page.getByText(/already exists|lead with the email/i).first();
+            const navigated = await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 20000 })
+              .then(() => true)
+              .catch(() => false);
+
+            if (!navigated) {
+              if (await alreadyExists.isVisible({ timeout: 3000 }).catch(() => false)) {
+                console.log('Lead already exists for email — closing form and opening existing lead');
+                await page.keyboard.press('Escape').catch(() => undefined);
+                await leadForm.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => undefined);
+                reusedExistingLead = true;
+                await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
+                const leadCard = page.locator('h3, h4, a').filter({ hasText: nameRe }).first();
+                await leadCard.waitFor({ state: 'visible', timeout: 20000 });
+                await leadCard.click();
+                await page.waitForURL(/\/crm\/leads\/(?!create)/, { timeout: 20000 });
+              } else {
+                await leadForm.press('End').catch(() => undefined);
+                await submitLeadBtn.click({ force: true });
+                await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
+                console.log('Lead created:', data.fullName, data.email, data.mobile);
+              }
+            } else {
+              console.log('Lead created:', data.fullName, data.email, data.mobile);
             }
           }
-          console.log('On Deal Details — lead flow skipped');
+
+          // If we landed on a contact (search match), jump to leads list for this person
+          if (page.url().includes('/crm/contacts/')) {
+            await page.goto('https://test.propexcel.com/crm/leads', { waitUntil: 'domcontentloaded' });
+            const leadCard = page.locator('h3, h4, a').filter({ hasText: nameRe }).first();
+            await leadCard.waitFor({ state: 'visible', timeout: 15000 });
+            await leadCard.click();
+            await page.waitForURL(/\/crm\/leads\//, { timeout: 20000 });
+          }
+
+          const leadUrl = page.url();
+          if (!/\/crm\/leads\/(?!create)/.test(leadUrl)) {
+            throw new Error(`Expected lead details URL after create/reuse, got: ${leadUrl}`);
+          }
+
+          // Must auto-create Contact with same details — stop if missing
+          await verifyAutoCreatedContact(page, data);
+
+          // Back to lead → Convert to Deal (required for freshly created leads)
+          await page.goto(leadUrl, { waitUntil: 'domcontentloaded' });
+          await dismissEndToEndFlowTour(page);
+          await dismissNotificationsModal(page);
+          await page.waitForURL(/\/crm\/leads\/(?!create)/, { timeout: 30000 });
+
+          const convertBtn = page.getByRole('button', { name: /Convert to Deal/i })
+            .or(page.locator('button').filter({ hasText: /Convert to Deal/i }))
+            .first();
+
+          const convertVisible = await convertBtn.waitFor({ state: 'visible', timeout: 30000 })
+            .then(() => true)
+            .catch(() => false);
+
+          if (convertVisible && await convertBtn.isEnabled().catch(() => true)) {
+            await convertBtn.click();
+            const convertDialog = page.getByRole('dialog', { name: /Convert Lead to Deal/i });
+            await convertDialog.waitFor({ state: 'visible', timeout: 15000 });
+            const paymentCombo = convertDialog.getByRole('combobox', { name: /payment type|Select payment type/i })
+              .or(convertDialog.getByText(/Select payment type/i));
+            await paymentCombo.first().click();
+            await page.getByRole('option').first().waitFor({ state: 'visible', timeout: 10000 });
+            await page.getByRole('option').first().click();
+            await convertDialog.getByRole('button', { name: /Convert to Deal/i }).click();
+            await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
+            console.log('Converted lead to deal:', data.fullName);
+          } else if (reusedExistingLead) {
+            console.log('Convert to Deal not available on reused lead — opening existing deal');
+          } else {
+            throw new Error(`Convert to Deal not available on fresh lead ${data.fullName} (${leadUrl})`);
+          }
+
+          if (!page.url().includes('/crm/deals/')) {
+            await page.goto('https://test.propexcel.com/crm/deals', { waitUntil: 'domcontentloaded' });
+            await dismissEndToEndFlowTour(page);
+            const dealSearch = page.getByPlaceholder(/Search by Deals|Search/i).first()
+              .or(page.getByRole('combobox', { name: /Search/i }).first());
+            if (await dealSearch.isVisible({ timeout: 5000 }).catch(() => false)) {
+              await dealSearch.fill(data.fullName);
+              await page.waitForTimeout(1000);
+            }
+            const dealCard = page.locator('h3, h4, a')
+              .filter({ hasText: nameRe })
+              .first();
+            await dealCard.waitFor({ state: 'visible', timeout: 30000 });
+            await dealCard.click();
+          }
+          await page.getByRole('heading', { name: 'Deal Details', level: 1 }).waitFor({ timeout: 30000 });
+          console.log('On Deal Details — converted from direct lead');
       }
       {
 
@@ -865,21 +912,11 @@ test('Skip lead — existing contact Create Deal through rent payment (new org)'
       }
       {
 
-          await page.getByRole('button', { name: 'Approve Contract' }).click();
-          const approveContractDialog = page.getByRole('dialog');
-          if (await approveContractDialog.isVisible({ timeout: 5000 }).catch(() => false)) {
-            await approveContractDialog.getByRole('button', { name: /Approve|Confirm|Yes|Submit/i }).click();
-          }
-          await page.waitForURL(/\/accounts\/contracts\//, { timeout: 30000 }).catch(async () => {
-            await page.getByRole('button', { name: 'View Contract' }).click();
-            await page.waitForURL(/\/accounts\/contracts\//, { timeout: 30000 });
-          });
+          await approveContractUntilActive(page);
       }
       {
 
-          await page.getByRole('tab', { name: 'Action Buttons' }).click();
-          await page.getByRole('button', { name: /Create Tenant User/i }).click();
-          const dialogPassword = await confirmCreateTenantUserAndCapturePassword(page, passwordCapture);
+          const dialogPassword = await ensureTenantUserOnContract(page, passwordCapture);
           if (dialogPassword) {
             console.log('Tenant password captured for tenant user');
           }
@@ -889,28 +926,7 @@ test('Skip lead — existing contact Create Deal through rent payment (new org)'
       }
       {
 
-          await page.getByRole('tab', { name: 'Action Buttons' }).click();
-          await page.getByRole('button', { name: /Create Move In Request/i }).click();
-          const moveInDialog = page.getByRole('dialog', { name: /Create Move-In Date/i });
-          await moveInDialog.waitFor({ state: 'visible', timeout: 10000 });
-          const dateField = moveInDialog.getByLabel('Tenant Move-in Date');
-          await dateField.click();
-          await dateField.fill('');
-          await dateField.fill(moveInDate);
-          await dateField.press('Tab').catch(() => undefined);
-          const confirmMoveIn = moveInDialog.getByRole('button', { name: /^Confirm$/i });
-          await expect(confirmMoveIn).toBeEnabled({ timeout: 10000 });
-          await confirmMoveIn.click();
-          // Dialog may stay open briefly or need a second confirm — don't hard-fail the whole flow
-          const closed = await moveInDialog.waitFor({ state: 'hidden', timeout: 20000 }).then(() => true).catch(() => false);
-          if (!closed) {
-            console.log('Move-in dialog still open — retrying Confirm / Escape');
-            await confirmMoveIn.click({ force: true }).catch(() => undefined);
-            await moveInDialog.waitFor({ state: 'hidden', timeout: 10000 }).catch(async () => {
-              await page.keyboard.press('Escape');
-              await moveInDialog.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => undefined);
-            });
-          }
+          await ensureMoveInRequest(page, moveInDate);
       }
       {
 
@@ -1159,6 +1175,8 @@ test('Skip lead — existing contact Create Deal through rent payment (new org)'
     orgId: admin.orgId,
     moveInDate,
   });
+
+  commitSequentialTenantIdentity(data.tenantNumber);
 
   passwordCapture.dispose();
 });

@@ -14,12 +14,17 @@ const SKIP_MAIL_SUBJECT = /contract sent|move-in request|invoice/i;
 
 function decodeHtmlEntities(value: string): string {
   return value
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/gi, ' ');
+    .replace(/&nbsp;/gi, ' ')
+    // Strip truncated entity leftovers from HTML mail scraping
+    .replace(/&#?\w*;?$/g, '')
+    .replace(/&+/g, '');
 }
 
 function isValidPassword(password?: string): password is string {
@@ -29,7 +34,7 @@ function isValidPassword(password?: string): password is string {
   if (!/[A-Za-z0-9]/.test(password)) {
     return false;
   }
-  if (/<\/?[a-z][a-z0-9]*[\s>\/]/i.test(password) || /&[a-z]+;/i.test(password)) {
+  if (/<\/?[a-z][a-z0-9]*[\s>\/]/i.test(password) || /&[#a-z0-9]+;?/i.test(password)) {
     return false;
   }
   return true;
@@ -158,6 +163,47 @@ export async function captureTenantPasswordFromDialog(page: Page): Promise<strin
   }
 
   return undefined;
+}
+
+/**
+ * On Contract Action Buttons: create tenant user if available.
+ * If Revoke Tenant User is shown, the user already exists — skip create.
+ * Buttons often expose a heading child rather than an accessible name.
+ */
+export async function ensureTenantUserOnContract(
+  page: Page,
+  passwordCapture: ReturnType<typeof createTenantPasswordCapture>,
+): Promise<string | undefined> {
+  await page.getByRole('tab', { name: 'Action Buttons' }).click();
+  await page.getByRole('tabpanel', { name: 'Action Buttons' })
+    .waitFor({ state: 'visible', timeout: 15000 })
+    .catch(() => undefined);
+
+  const createBtn = page.getByRole('button', { name: /Create Tenant User/i })
+    .or(page.locator('button').filter({ has: page.getByRole('heading', { name: /Create Tenant User/i }) }))
+    .first();
+  const revokeBtn = page.getByRole('button', { name: /Revoke Tenant User/i })
+    .or(page.locator('button').filter({ has: page.getByRole('heading', { name: /Revoke Tenant User/i }) }))
+    .first();
+
+  // Prefer revoke check first when both could race (reused contacts).
+  if (await revokeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    console.log('Tenant user already exists (Revoke Tenant User) — skipping create');
+    return passwordCapture.getPassword();
+  }
+
+  if (await createBtn.isVisible({ timeout: 15000 }).catch(() => false)) {
+    await createBtn.click();
+    return confirmCreateTenantUserAndCapturePassword(page, passwordCapture);
+  }
+
+  // Final re-check for revoke after create wait (UI may lag).
+  if (await revokeBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+    console.log('Tenant user already exists (Revoke Tenant User) — skipping create');
+    return passwordCapture.getPassword();
+  }
+
+  throw new Error('Neither Create Tenant User nor Revoke Tenant User found on Action Buttons');
 }
 
 /** Click Create Tenant User confirm and poll API/dialog for the generated password. */
