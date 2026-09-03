@@ -251,6 +251,10 @@ function parsePasswordFromHtml(html: string): string | undefined {
   const patterns = [
     /Temporary Password[\s\S]*?<\/td>\s*<td[^>]*>\s*([^<\s]{6,64}|[^<\s]*(?:&(?:lt|gt|amp|quot|#\d+);[^<\s]*)+)\s*<\/td>/i,
     /Temporary Password[\s\S]*?<td[^>]*>\s*([^<\s]{6,64}|[^<\s]*(?:&(?:lt|gt|amp|quot|#\d+);[^<\s]*)+)\s*<\/td>/i,
+    // Password wrapped in span/strong/b inside a cell
+    /Temporary Password[\s\S]{0,600}?<t[dh][^>]*>\s*(?:<[^>]+>\s*)*([^<\s]{6,64})\s*(?:<\/[^>]+>\s*)*<\/t[dh]>/i,
+    // Plain HTML after label
+    /Temporary Password(?:\s*:)?\s*(?:<[^>]+>\s*)*([A-Za-z0-9!@#$%^&*_+=.?\-]{6,64})/i,
   ];
 
   for (const pattern of patterns) {
@@ -259,6 +263,20 @@ function parsePasswordFromHtml(html: string): string | undefined {
     if (isValidPassword(password)) {
       return password;
     }
+  }
+
+  // Last resort: strip tags near "Temporary Password" and parse as text
+  const idx = html.toLowerCase().indexOf('temporary password');
+  if (idx >= 0) {
+    const snippet = html
+      .slice(idx, idx + 800)
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/\s+/g, ' ');
+    const fromText = parsePasswordFromText(snippet);
+    if (fromText) return fromText;
   }
 
   return undefined;
@@ -679,6 +697,40 @@ export function startGmailCredentialPolling(_context: BrowserContext, email: str
       }
     }
   })();
+}
+
+/**
+ * Open tenant portal via email magic/login link (includes SendGrid click-tracking URLs
+ * that redirect to test.propexcel.com).
+ */
+export async function loginTenantViaEmailLink(
+  page: Page,
+  loginLink: string,
+): Promise<void> {
+  await page.goto(loginLink, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  });
+  await page.waitForURL(
+    (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
+    { timeout: 60000 },
+  );
+}
+
+/**
+ * After a magic-link login (or when IMAP returned link-only), keep polling briefly
+ * so shared tenant.json can still store a password for later steps.
+ */
+export async function pollImapForPassword(
+  email: string,
+  timeoutMs = 90_000,
+): Promise<string | undefined> {
+  try {
+    const creds = await getTenantCredentialsFromImap(email, timeoutMs);
+    return isValidPassword(creds.password) ? creds.password : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** @deprecated Use startGmailCredentialPolling — kept for older imports. */

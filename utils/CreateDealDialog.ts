@@ -1,16 +1,27 @@
 import type { Locator, Page } from '@playwright/test';
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Select an existing contact in the Create Deal slide-over.
  * Scoped to the dialog only — page-wide locators can match deal cards behind the drawer.
+ *
+ * Search uses the person full name / email (what CRM search indexes).
+ * Optional `matchAlso` covers Company contacts whose dropdown row shows company name.
  */
 export async function selectContactInCreateDealDialog(
   page: Page,
   dealDialog: Locator,
-  fullName: string,
+  searchName: string,
+  options?: { matchAlso?: string[] },
 ): Promise<void> {
-  const escapedName = fullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const nameRe = new RegExp(escapedName, 'i');
+  const matchParts = [searchName, ...(options?.matchAlso ?? [])]
+    .map((v) => v?.trim())
+    .filter((v): v is string => !!v && v.length > 0);
+  const uniqueParts = [...new Set(matchParts)];
+  const matchRe = new RegExp(uniqueParts.map(escapeRegExp).join('|'), 'i');
 
   const searchBox = dealDialog
     .getByPlaceholder(/Search by Name, Email or Phone|Search and select|Search/i)
@@ -20,16 +31,30 @@ export async function selectContactInCreateDealDialog(
   await searchBox.waitFor({ state: 'visible', timeout: 15000 });
   await searchBox.click();
   await searchBox.fill('');
-  await searchBox.fill(fullName);
+  await searchBox.fill(searchName);
   await page.waitForTimeout(800);
 
-  // Result row: "tenantN" + "Contact • email" inside a clickable row (not h3/h4).
-  const contactRow = dealDialog
+  const rowBase = dealDialog
     .locator('[cursor="pointer"], .cursor-pointer')
-    .filter({ hasText: nameRe })
-    .filter({ hasText: /Contact\s*•/i })
-    .filter({ hasNotText: /Create New Deal/i })
-    .first();
+    .filter({ hasText: /(Contact|Company)\s*•/i })
+    .filter({ hasNotText: /Create New Deal/i });
+
+  let contactRow = rowBase.filter({ hasText: matchRe }).first();
+  if (!(await contactRow.isVisible({ timeout: 5000 }).catch(() => false))) {
+    // Retry search with email-like token if present in matchAlso
+    const emailLike = uniqueParts.find((p) => p.includes('@'));
+    if (emailLike && emailLike !== searchName) {
+      await searchBox.fill('');
+      await searchBox.fill(emailLike);
+      await page.waitForTimeout(800);
+      contactRow = rowBase.filter({ hasText: matchRe }).first();
+    }
+  }
+
+  // Last resort: any Contact/Company row after search (single-result lists)
+  if (!(await contactRow.isVisible({ timeout: 3000 }).catch(() => false))) {
+    contactRow = rowBase.first();
+  }
 
   await contactRow.waitFor({ state: 'visible', timeout: 20000 });
   await contactRow.scrollIntoViewIfNeeded().catch(() => undefined);

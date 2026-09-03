@@ -1,22 +1,25 @@
-import { test, expect } from '../utils/test';
+import { test, expect } from '../../utils/test';
 import {
   confirmCreateTenantUserAndCapturePassword,
   createTenantPasswordCapture,
   resolveTenantCredentials,
   startGmailCredentialPolling,
   getTenantCredentialsFromImap,
-} from "../utils/TenantCredentials";
-import { saveSharedTenantDataNewOrg } from "../utils/SharedTenantData";
-import { loadSharedOrgData } from "../utils/SharedOrgData";
-import { FlowPerfTracker, saveFlowPerformance } from "../utils/FlowPerformance";
-import { fillInvoiceLineItemWithRentalIncome } from "../utils/InvoiceLineItem";
+  loginTenantViaEmailLink,
+  pollImapForPassword,
+} from "../../utils/TenantCredentials";
+import { saveSharedTenantDataNewOrgCompany } from "../../utils/SharedTenantData";
+import { loadSharedOrgData } from "../../utils/SharedOrgData";
+import { FlowPerfTracker, saveFlowPerformance } from "../../utils/FlowPerformance";
+import { fillInvoiceLineItemWithRentalIncome } from "../../utils/InvoiceLineItem";
 import {
   buildTenantIdentityAt,
   commitSequentialTenantIdentity,
   fillIndiaPhoneInContactDialog,
   fillIndiaPhoneInLeadForm,
   peekNextNewOrgTenantIdentity,
-} from "../utils/SharedTenantContactData";
+} from "../../utils/SharedTenantContactData";
+import { invoiceBilledToSearchName, selectCompanyContactTypeAndFill } from "../../utils/CompanyContact";
 
 function formatMoveInDate(date: Date = new Date()) {
   const day = String(date.getDate()).padStart(2, '0');
@@ -38,6 +41,7 @@ function parseTenantNumber(name: string): number | null {
 
 type FlowTenantData = {
   fullName: string;
+  companyName?: string;
   email: string;
   mobile: string;
   propertyName: string;
@@ -120,6 +124,8 @@ async function createContactWithSequentialRetry(
     await page.getByRole('button', { name: 'Create Contact' }).click();
     const createDialog = page.getByRole('dialog', { name: 'Create New Contact' });
     await createDialog.waitFor();
+    const company = await selectCompanyContactTypeAndFill(createDialog);
+    data.companyName = company.companyName;
     await createDialog.getByRole('textbox', { name: 'Enter full name' }).fill(data.fullName);
     await createDialog.getByRole('textbox', { name: 'name@example.com' }).fill(data.email);
     await fillIndiaPhoneInContactDialog(createDialog, data.mobile);
@@ -250,6 +256,15 @@ async function createLeadViaLeadsPage(page: import('@playwright/test').Page, dat
   const leadForm = page.getByRole('dialog').filter({ hasText: /Create New Lead/i });
   await leadForm.waitFor({ state: 'visible', timeout: 15000 });
 
+  // Ensure Company type on lead (contact may already be company; still set if radios visible)
+  const companyRadio = leadForm.getByRole('radio', { name: /^Company$/i }).first();
+  if (await companyRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const company = await selectCompanyContactTypeAndFill(leadForm, {
+      companyName: data.companyName,
+    });
+    data.companyName = company.companyName;
+  }
+
   const nameField = leadForm.getByRole('textbox', { name: 'Full name' })
     .or(leadForm.getByPlaceholder('Full name'))
     .first();
@@ -327,6 +342,13 @@ async function openContactAndCreateOrOpenLead(page: import('@playwright/test').P
 
   await leadForm.waitFor({ state: 'visible', timeout: 15000 });
   await page.getByRole('heading', { name: /Create New Lead/i }).waitFor({ timeout: 15000 }).catch(() => undefined);
+  const companyRadio = leadForm.getByRole('radio', { name: /^Company$/i }).first();
+  if (await companyRadio.isVisible({ timeout: 3000 }).catch(() => false)) {
+    const company = await selectCompanyContactTypeAndFill(leadForm, {
+      companyName: data.companyName,
+    });
+    data.companyName = company.companyName;
+  }
   await submitLeadForm(page, leadForm, data);
 }
 
@@ -1106,7 +1128,7 @@ async function approveDealViaApprovalWorkflow(page: import('@playwright/test').P
   }
 }
 
-test('Flow 1 with New Organization — tenant onboarding and rent collection', async ({ page, context }) => {
+test('Flow 1 Company Category — New Organization tenant onboarding and rent collection', async ({ page, context }) => {
   const data: FlowTenantData = {
     fullName: '',
     email: '',
@@ -1414,17 +1436,15 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
               throw new Error(`Tenant login failed for ${data.email} after retries`);
             }
           } else if (tenantCredentials.loginLink) {
-            await page.goto(tenantCredentials.loginLink, {
-              waitUntil: 'domcontentloaded',
-              timeout: 60000,
-            });
-            await page.waitForURL(
-              (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
-              { timeout: 60000 },
-            );
+            // SendGrid click-tracking links redirect into the tenant portal
+            await loginTenantViaEmailLink(page, tenantCredentials.loginLink);
+            console.log('Tenant logged in via email login link');
+            if (!tenantPassword) {
+              tenantPassword = await pollImapForPassword(data.email, 90_000);
+            }
           } else {
             throw new Error(`No tenant password available for ${data.email}`);
-          }
+      }
 
           const tenantProfile = page.getByRole('button', { name: new RegExp(data.fullName, 'i') });
           if (await tenantProfile.first().isVisible({ timeout: 5000 }).catch(() => false)) {
@@ -1448,9 +1468,12 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
           await page.getByRole('button', { name: /Create Invoice/i }).click();
 
           await page.getByText('Search and select contact or tenant', { exact: true }).click();
-          await page.getByPlaceholder('Search...').fill(data.fullName);
+          const billedToName = invoiceBilledToSearchName(data);
+          await page.getByPlaceholder('Search...').fill(billedToName);
 
-          const tenantOption = page.getByText(new RegExp(`${data.fullName}.*\\(Tenant\\)`, 'i')).first();
+          const tenantOption = page.getByText(
+            new RegExp(`${escapeRegExp(billedToName)}.*\\(Tenant\\)`, 'i'),
+          ).first();
           await tenantOption.waitFor({ state: 'visible', timeout: 15000 });
           await tenantOption.click();
 
@@ -1513,6 +1536,8 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
           await logoutAdmin(page, admin.orgName);
 
           // Login again as tenant
+          // Login again as tenant
+          let secondLoginViaLink = false;
           if (!tenantPassword) {
             const refreshed = await resolveTenantCredentials({
               capturedPassword: passwordCapture.getPassword(),
@@ -1521,19 +1546,25 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
               context,
               email: data.email,
             });
-            tenantPassword = refreshed.password;
+            tenantPassword = refreshed.password ?? await pollImapForPassword(data.email, 90_000);
+            if (!tenantPassword && refreshed.loginLink) {
+              await loginTenantViaEmailLink(page, refreshed.loginLink);
+              secondLoginViaLink = true;
+              tenantPassword = await pollImapForPassword(data.email, 60_000);
+            }
           }
-          if (!tenantPassword) {
-            throw new Error(`No tenant password available for second login: ${data.email}`);
+          if (!secondLoginViaLink) {
+            if (!tenantPassword) {
+              throw new Error(`No tenant password available for second login: ${data.email}`);
+            }
+            await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
+            await fillLoginFields(page, admin.orgId, data.email, tenantPassword);
+            await page.getByRole('button', { name: 'Sign In' }).click();
+            await page.waitForURL(
+              (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
+              { timeout: 60000 },
+            );
           }
-
-          await page.goto('https://test.propexcel.com/login', { waitUntil: 'domcontentloaded' });
-          await fillLoginFields(page, admin.orgId, data.email, tenantPassword);
-          await page.getByRole('button', { name: 'Sign In' }).click();
-          await page.waitForURL(
-            (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
-            { timeout: 60000 },
-          );
 
           // Tenant portal: Invoices → pay online via Razorpay
           await page.goto('https://test.propexcel.com/tenant/invoices', { waitUntil: 'domcontentloaded' });
@@ -1581,11 +1612,15 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
 
 
   if (!tenantPassword) {
+    tenantPassword = await pollImapForPassword(data.email, 120_000);
+  }
+  if (!tenantPassword) {
     throw new Error('Cannot save shared tenant data — password is missing.');
   }
 
-  saveSharedTenantDataNewOrg({
+  saveSharedTenantDataNewOrgCompany({
     fullName: data.fullName,
+    companyName: data.companyName,
     email: data.email,
     mobile: data.mobile,
     propertyName: data.propertyName,
