@@ -666,7 +666,7 @@ async function clickTopNavModule(page: import('@playwright/test').Page, ariaLabe
       await btn.waitFor({ state: 'attached', timeout: 8000 });
       await btn.evaluate((el) => (el as HTMLElement).click());
       return;
-    } catch {
+          } catch {
       // Fall through to URL navigation
     }
   }
@@ -1005,7 +1005,7 @@ async function logoutAdmin(page: import('@playwright/test').Page, profileHint?: 
     await byHint.first().click();
   } else if (await page.getByRole('button', { name: /Super Admin/i }).first().isVisible({ timeout: 2000 }).catch(() => false)) {
     await page.getByRole('button', { name: /Super Admin/i }).first().click();
-  } else {
+          } else {
     await page.locator('header').getByRole('button').last().click();
   }
   await page.getByText('Logout', { exact: true }).click();
@@ -1251,19 +1251,19 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
             console.log(`Deal already has property — reusing ${data.propertyName}`);
           } else if (await addPropertyBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
             await addPropertyBtn.click();
-            const addPropertyDialog = page.getByRole('dialog', { name: 'Add Property to Deal' });
-            await addPropertyDialog.getByRole('combobox', { name: 'Search...' }).fill(data.propertyName);
-            const propertyCard = addPropertyDialog.getByRole('heading', { name: data.propertyName });
-            if (await propertyCard.isVisible({ timeout: 5000 }).catch(() => false)) {
-              await propertyCard.click();
-            } else {
-              await addPropertyDialog.locator('h3').first().click();
-            }
-            await addPropertyDialog.getByRole('button', { name: 'Add Property' }).click();
-            await addPropertyDialog.waitFor({ state: 'hidden' });
+          const addPropertyDialog = page.getByRole('dialog', { name: 'Add Property to Deal' });
+          await addPropertyDialog.getByRole('combobox', { name: 'Search...' }).fill(data.propertyName);
+          const propertyCard = addPropertyDialog.getByRole('heading', { name: data.propertyName });
+          if (await propertyCard.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await propertyCard.click();
+          } else {
+            await addPropertyDialog.locator('h3').first().click();
+          }
+          await addPropertyDialog.getByRole('button', { name: 'Add Property' }).click();
+          await addPropertyDialog.waitFor({ state: 'hidden' });
           } else {
             console.log(`Add Property not available — assuming ${data.propertyName} already on deal`);
-          }
+      }
 
           const dealPropertyCard = page.locator('h4', { hasText: data.propertyName }).locator('xpath=ancestor::div[contains(@class,"rounded-2xl")]').first();
           const taxCombobox = dealPropertyCard.getByRole('combobox');
@@ -1392,7 +1392,7 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
                       timeout: 60000,
                     });
                     await page.waitForURL(
-                      (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
+              (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
                       { timeout: 45000 },
                     );
                     loggedIn = true;
@@ -1405,7 +1405,7 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
                 }
                 if (retryCredentials.password && !triedPasswords.has(retryCredentials.password)) {
                   passwordToUse = retryCredentials.password;
-                  tenantPassword = retryCredentials.password;
+              tenantPassword = retryCredentials.password;
                 }
                 await page.waitForTimeout(5000);
               }
@@ -1418,13 +1418,13 @@ test('Flow 1 with New Organization — tenant onboarding and rent collection', a
               waitUntil: 'domcontentloaded',
               timeout: 60000,
             });
-            await page.waitForURL(
-              (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
-              { timeout: 60000 },
-            );
+          await page.waitForURL(
+            (url) => url.hostname.includes('test.propexcel.com') && !url.pathname.includes('/login'),
+            { timeout: 60000 },
+          );
           } else {
             throw new Error(`No tenant password available for ${data.email}`);
-          }
+      }
 
           const tenantProfile = page.getByRole('button', { name: new RegExp(data.fullName, 'i') });
           if (await tenantProfile.first().isVisible({ timeout: 5000 }).catch(() => false)) {

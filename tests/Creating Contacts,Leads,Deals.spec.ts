@@ -184,8 +184,14 @@ async function createContact(page: import('@playwright/test').Page, data: Person
 /**
  * Create Lead from Leads page (NOT from a contact):
  * Create Lead → search random value → click "Create New Lead" → fill lead details → submit.
+ * When convertToDeal is false, stops on Lead Details (contact is auto-created by the app).
  */
-async function createLeadStandalone(page: import('@playwright/test').Page, data: PersonData) {
+async function createLeadStandalone(
+  page: import('@playwright/test').Page,
+  data: PersonData,
+  options: { convertToDeal?: boolean } = {},
+) {
+  const convertToDeal = options.convertToDeal !== false;
   await goToCrmLeads(page);
 
   // 1) Open Create Lead modal
@@ -274,6 +280,15 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
     await page.waitForURL(/\/crm\/leads\/(?!create)[^/]+$/, { timeout: 45000 });
   }
 
+  commitSequentialTenantIdentity(data.tenantNumber);
+
+  if (!convertToDeal) {
+    const convertBtn = page.getByRole('button', { name: 'Convert to Deal' });
+    await convertBtn.waitFor({ state: 'visible', timeout: 30000 });
+    console.log('Lead created (not converted; contact auto-created):', data.fullName, data.email, data.mobile);
+    return;
+  }
+
   // Lead Details page → click Convert to Deal
   const convertBtn = page.getByRole('button', { name: 'Convert to Deal' });
   await convertBtn.waitFor({ state: 'visible', timeout: 30000 });
@@ -294,14 +309,14 @@ async function createLeadStandalone(page: import('@playwright/test').Page, data:
   console.log(`Payment Type -> [${paymentIndex + 1}/${paymentCount}] ${paymentLabel}`);
   await convertDialog.getByRole('button', { name: 'Convert to Deal' }).click();
   await convertDialog.waitFor({ state: 'hidden', timeout: 30000 });
-  commitSequentialTenantIdentity(data.tenantNumber);
   console.log('Converted lead to deal:', data.fullName, data.email, data.mobile);
 }
 
-test('Creating Contacts and Leads (4 each, sequential tenantN)', async ({ page, context }) => {
+test('Creating Contacts and Leads (4 each + 1 unconverted lead, sequential tenantN)', async ({ page, context }) => {
   const admin = loadSharedOrgData();
   const contacts: PersonData[] = [];
   const leads: PersonData[] = [];
+  let unconvertedLead: PersonData | undefined;
 
   console.log('Admin login (from CreateOrganization org.json):', {
     orgId: admin.orgId,
@@ -309,9 +324,9 @@ test('Creating Contacts and Leads (4 each, sequential tenantN)', async ({ page, 
     orgName: admin.orgName,
   });
   console.log('Contacts to create: (peeked one at a time during run)');
-  console.log('Leads to create: (peeked one at a time during run)');
+  console.log('Leads to create: 4 converted + 1 unconverted (peeked one at a time during run)');
 
-  test.setTimeout(400_000);
+  test.setTimeout(480_000);
   page.setDefaultTimeout(30_000);
   await context.grantPermissions(['geolocation'], { origin: 'https://test.propexcel.com' });
 
@@ -336,13 +351,20 @@ test('Creating Contacts and Leads (4 each, sequential tenantN)', async ({ page, 
     }
   }
 
-  // Phase 2: Left sidebar → Leads → create 4 leads (next tenantN sequence)
+  // Phase 2: Left sidebar → Leads → create 4 leads (converted to deal)
   {
     for (let i = 0; i < 4; i++) {
       const person = peekTenantPerson();
-      await createLeadStandalone(page, person);
+      await createLeadStandalone(page, person, { convertToDeal: true });
       leads.push(person);
     }
+  }
+
+  // Phase 3: one more lead — do NOT convert (for Existing Lead → … Payment; contact auto-created)
+  {
+    const person = peekTenantPerson();
+    await createLeadStandalone(page, person, { convertToDeal: false });
+    unconvertedLead = person;
   }
 
   // Persist contacts + leads for existing-scenario reuse
@@ -352,6 +374,9 @@ test('Creating Contacts and Leads (4 each, sequential tenantN)', async ({ page, 
       orgName: admin.orgName,
       contacts: contacts.map(({ fullName, email, mobile }) => ({ fullName, email, mobile })),
       leads: leads.map(({ fullName, email, mobile }) => ({ fullName, email, mobile })),
+      unconvertedLead: unconvertedLead
+        ? { fullName: unconvertedLead.fullName, email: unconvertedLead.email, mobile: unconvertedLead.mobile }
+        : undefined,
     });
   }
 });

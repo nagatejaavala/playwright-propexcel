@@ -13,7 +13,13 @@ export type SharedCrmData = {
   orgId: string;
   orgName?: string;
   contacts: SharedCrmPerson[];
+  /** Leads that were converted to deals (used by Existing Deal flows). */
   leads: SharedCrmPerson[];
+  /**
+   * Lead created without Convert to Deal (contact auto-created).
+   * Used by Existing Lead → Deal → … Payment.
+   */
+  unconvertedLead?: SharedCrmPerson;
   savedAt: string;
 };
 
